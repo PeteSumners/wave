@@ -78,7 +78,9 @@ class Container {
     if (!this.inputs.pointer) return;
     if (document.pointerLockElement === this.canvas) return;
     this.canvas.requestPointerLock();
-    setTimeout(() => this.insistOnPointerLock(), 100);
+    // Retry pointer lock every 100ms until successful
+    const kPointerLockRetryMs = 100;
+    setTimeout(() => this.insistOnPointerLock(), kPointerLockRetryMs);
   }
 
   private onKeyInput(e: Event, down: boolean): void {
@@ -333,9 +335,10 @@ class Performance {
 
 //////////////////////////////////////////////////////////////////////////////
 
-const kTickResolution = 4;
-const kTicksPerFrame = 4;
-const kTicksPerSecond = 60;
+// Physics timing configuration
+const kTickResolution = 4;    // Subdivisions per physics tick for smooth updates
+const kTicksPerFrame = 4;     // Maximum physics ticks to process per render frame
+const kTicksPerSecond = 60;   // Target physics update rate (Hz)
 
 type Callback = (dt: number) => void;
 
@@ -439,12 +442,14 @@ const kSweepCollisionImpacts = Vec3.create();
 const kMinZLowerBound = 0.001;
 const kMinZUpperBound = 0.1;
 
-const kChunkWidth  = 16;
-const kWorldHeight = 256;
+// Voxel world dimensions
+const kChunkWidth  = 16;   // Width/depth of each chunk in blocks (x, z dimensions)
+const kWorldHeight = 256;  // Total world height in blocks (y dimension)
 
-const kChunkRadius = 12;
-const kFrontierRadius = 8;
-const kFrontierLevels = 6;
+// Chunk streaming configuration
+const kChunkRadius = 12;      // Full detail chunks around player (±12 = 25×25 grid)
+const kFrontierRadius = 8;    // LOD frontier chunks beyond main radius
+const kFrontierLevels = 6;    // Number of LOD levels for distant terrain
 
 // Maximum light level (15). Matches Minecraft's lighting system.
 const kSunlightLevel = 0xf;

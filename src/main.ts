@@ -9,9 +9,11 @@ import {sweep} from './sweep.js';
 
 //////////////////////////////////////////////////////////////////////////////
 
-const kNumParticles = 16;
-const kMaxNumParticles = 64;
+// Particle system configuration
+const kNumParticles = 16;        // Particles spawned per block break
+const kMaxNumParticles = 64;     // Maximum concurrent particles (performance limit)
 
+// Water flow simulation timing (milliseconds between flow iterations)
 const kWaterDelay = 200;
 const kWaterDisplacements = [
   [1, 0, 0],
@@ -162,22 +164,25 @@ interface PhysicsState {
   autoStepMax: number,
 };
 
-const kTmpGravity = Vec3.from(0, -40, 0);
-const kTmpAcceleration = Vec3.create();
-const kTmpFriction = Vec3.create();
-const kTmpDelta = Vec3.create();
-const kTmpSize = Vec3.create();
-const kTmpPush = Vec3.create();
-const kTmpMax = Vec3.create();
-const kTmpMin = Vec3.create();
-const kTmpPos = Vec3.create();
-const kTmpResting = Vec3.create();
+// Physics constants
+const kGravityAcceleration = Vec3.from(0, -40, 0);  // Gravity: 40 units/sec² downward
+
+// Physics working buffers (reused across physics calculations for performance)
+const kPhysicsAcceleration = Vec3.create();  // Accumulated acceleration per frame
+const kPhysicsFriction = Vec3.create();      // Friction force calculations
+const kPhysicsDelta = Vec3.create();         // Movement/velocity deltas
+const kPhysicsSize = Vec3.create();          // Entity size calculations
+const kMovementForce = Vec3.create();        // Movement input force
+const kPhysicsBoundsMax = Vec3.create();     // AABB max corner for collision tests
+const kPhysicsBoundsMin = Vec3.create();     // AABB min corner for collision tests
+const kPhysicsPosition = Vec3.create();      // Temporary position calculations
+const kPhysicsResting = Vec3.create();       // Collision resting state per axis
 
 const setPhysicsFromPosition = (a: PositionState, b: PhysicsState) => {
-  Vec3.set(kTmpPos, a.x, a.y, a.z);
-  Vec3.set(kTmpSize, a.w / 2, a.h / 2, a.w / 2);
-  Vec3.sub(b.min, kTmpPos, kTmpSize);
-  Vec3.add(b.max, kTmpPos, kTmpSize);
+  Vec3.set(kPhysicsPosition, a.x, a.y, a.z);
+  Vec3.set(kPhysicsSize, a.w / 2, a.h / 2, a.w / 2);
+  Vec3.sub(b.min, kPhysicsPosition, kPhysicsSize);
+  Vec3.add(b.max, kPhysicsPosition, kPhysicsSize);
 };
 
 const setPositionFromPhysics = (a: PositionState, b: PhysicsState) => {
@@ -190,9 +195,9 @@ const applyFriction = (axis: int, state: PhysicsState, dv: Vec3) => {
   const resting = state.resting[axis];
   if (resting === 0 || resting * dv[axis] <= 0) return;
 
-  Vec3.copy(kTmpFriction, state.vel);
-  kTmpFriction[axis] = 0;
-  const length = Vec3.length(kTmpFriction);
+  Vec3.copy(kPhysicsFriction, state.vel);
+  kPhysicsFriction[axis] = 0;
+  const length = Vec3.length(kPhysicsFriction);
   if (length === 0) return;
 
   const loss = Math.abs(state.friction * dv[axis]);
@@ -263,18 +268,18 @@ const tryAutoStepping =
   const height = 1 - min[1] + Math.floor(min[1]);
   if (height > state.autoStepMax) return;
 
-  Vec3.set(kTmpDelta, 0, height, 0);
-  sweep(min, max, kTmpDelta, kTmpResting, check);
-  if (kTmpResting[1] !== 0) return;
+  Vec3.set(kPhysicsDelta, 0, height, 0);
+  sweep(min, max, kPhysicsDelta, kPhysicsResting, check);
+  if (kPhysicsResting[1] !== 0) return;
 
-  Vec3.scale(kTmpDelta, state.vel, dt);
-  kTmpDelta[1] = 0;
-  sweep(min, max, kTmpDelta, kTmpResting, check);
+  Vec3.scale(kPhysicsDelta, state.vel, dt);
+  kPhysicsDelta[1] = 0;
+  sweep(min, max, kPhysicsDelta, kPhysicsResting, check);
   if (min[0] === state.min[0] && min[2] === state.min[2]) return;
 
   if (height > state.autoStep) {
-    Vec3.set(kTmpDelta, 0, state.autoStep, 0);
-    sweep(state.min, state.max, kTmpDelta, state.resting, check);
+    Vec3.set(kPhysicsDelta, 0, state.autoStep, 0);
+    sweep(state.min, state.max, kPhysicsDelta, state.resting, check);
     if (!step_x) state.vel[0] = 0;
     if (!step_z) state.vel[2] = 0;
     state.vel[1] = 0;
@@ -283,7 +288,7 @@ const tryAutoStepping =
 
   Vec3.copy(state.min, min);
   Vec3.copy(state.max, max);
-  Vec3.copy(state.resting, kTmpResting);
+  Vec3.copy(state.resting, kPhysicsResting);
 };
 
 const runPhysics = (env: TypedEnv, dt: number, state: PhysicsState) => {
@@ -304,36 +309,40 @@ const runPhysics = (env: TypedEnv, dt: number, state: PhysicsState) => {
   state.inFluid = block !== kEmptyBlock && mesh === null;
   state.inGrass = block === nonnull(env.blocks).bush;
 
-  const drag = state.inFluid ? 2 : 0;
-  const left = Math.max(1 - drag * dt, 0);
-  const gravity = state.inFluid ? 0.25 : 1;
+  // Fluid dynamics - drag reduces velocity, gravity is weakened underwater
+  const kFluidDrag = 2;              // Drag coefficient for liquids
+  const kFluidGravityMultiplier = 0.25;  // Gravity is 1/4 strength in water (buoyancy)
 
-  Vec3.scale(kTmpAcceleration, state.forces, 1 / state.mass);
-  Vec3.scaleAndAdd(kTmpAcceleration, kTmpAcceleration, kTmpGravity, gravity);
-  Vec3.scale(kTmpDelta, kTmpAcceleration, dt);
-  Vec3.scaleAndAdd(kTmpDelta, kTmpDelta, state.impulses, 1 / state.mass);
+  const drag = state.inFluid ? kFluidDrag : 0;
+  const left = Math.max(1 - drag * dt, 0);
+  const gravity = state.inFluid ? kFluidGravityMultiplier : 1;
+
+  Vec3.scale(kPhysicsAcceleration, state.forces, 1 / state.mass);
+  Vec3.scaleAndAdd(kPhysicsAcceleration, kPhysicsAcceleration, kGravityAcceleration, gravity);
+  Vec3.scale(kPhysicsDelta, kPhysicsAcceleration, dt);
+  Vec3.scaleAndAdd(kPhysicsDelta, kPhysicsDelta, state.impulses, 1 / state.mass);
   if (state.friction) {
-    Vec3.add(kTmpAcceleration, kTmpDelta, state.vel);
-    applyFriction(0, state, kTmpAcceleration);
-    applyFriction(1, state, kTmpAcceleration);
-    applyFriction(2, state, kTmpAcceleration);
+    Vec3.add(kPhysicsAcceleration, kPhysicsDelta, state.vel);
+    applyFriction(0, state, kPhysicsAcceleration);
+    applyFriction(1, state, kPhysicsAcceleration);
+    applyFriction(2, state, kPhysicsAcceleration);
   }
 
   if (state.autoStep) {
-    Vec3.copy(kTmpMax, state.max);
-    Vec3.copy(kTmpMin, state.min);
+    Vec3.copy(kPhysicsBoundsMax, state.max);
+    Vec3.copy(kPhysicsBoundsMin, state.min);
   }
 
   // Update our state based on the computations above.
-  Vec3.add(state.vel, state.vel, kTmpDelta);
+  Vec3.add(state.vel, state.vel, kPhysicsDelta);
   Vec3.scale(state.vel, state.vel, left);
-  Vec3.scale(kTmpDelta, state.vel, dt);
-  sweep(state.min, state.max, kTmpDelta, state.resting, check);
+  Vec3.scale(kPhysicsDelta, state.vel, dt);
+  sweep(state.min, state.max, kPhysicsDelta, state.resting, check);
   Vec3.set(state.forces, 0, 0, 0);
   Vec3.set(state.impulses, 0, 0, 0);
 
   if (state.autoStep) {
-    tryAutoStepping(env, dt, state, kTmpMin, kTmpMax, check);
+    tryAutoStepping(env, dt, state, kPhysicsBoundsMin, kPhysicsBoundsMax, check);
   }
 
   for (let i = 0; i < 3; i++) {
@@ -441,16 +450,16 @@ const handleRunning = (dt: number, state: MovementState,
                        body: PhysicsState, grounded: boolean) => {
   const penalty = movementPenalty(state, body);
   const speed = penalty * state.maxSpeed;
-  Vec3.set(kTmpDelta, state.inputX * speed, 0, state.inputZ * speed);
-  Vec3.sub(kTmpPush, kTmpDelta, body.vel);
-  kTmpPush[1] = 0;
-  const length = Vec3.length(kTmpPush);
+  Vec3.set(kPhysicsDelta, state.inputX * speed, 0, state.inputZ * speed);
+  Vec3.sub(kMovementForce, kPhysicsDelta, body.vel);
+  kMovementForce[1] = 0;
+  const length = Vec3.length(kMovementForce);
   if (length === 0) return;
 
   const bound = state.moveForce * (grounded ? 1 : state.airMoveMultiplier);
   const input = state.responsiveness * length;
-  Vec3.scale(kTmpPush, kTmpPush, Math.min(bound, input) / length);
-  Vec3.add(body.forces, body.forces, kTmpPush);
+  Vec3.scale(kMovementForce, kMovementForce, Math.min(bound, input) / length);
+  Vec3.add(body.forces, body.forces, kMovementForce);
 };
 
 const generateParticles =
@@ -482,13 +491,17 @@ const generateParticles =
     position.z = z + (1 - size) * Math.random() + size / 2;
     position.w = position.h = size;
 
-    const kParticleSpeed = 8;
+    // Particle physics - random velocities for scatter effect
+    const kParticleSpeed = 8;         // Base velocity for block break particles
+    const kParticleFriction = 10;     // High friction for quick settle
+    const kParticleRestitution = 0.5; // Bounce coefficient (50% energy retention)
+
     const body = env.physics.add(particle);
     body.impulses[0] = kParticleSpeed * (Math.random() - 0.5);
     body.impulses[1] = kParticleSpeed * Math.random();
     body.impulses[2] = kParticleSpeed * (Math.random() - 0.5);
-    body.friction = 10;
-    body.restitution = 0.5;
+    body.friction = kParticleFriction;
+    body.restitution = kParticleRestitution;
 
     const mesh = env.meshes.add(particle);
     const sprite = {url: texture.url, x: texture.w, y: texture.h};
@@ -533,16 +546,16 @@ const tryToModifyBlock =
   if (target === null) return;
 
   const side = env.getTargetedBlockSide();
-  Vec3.copy(kTmpPos, target);
+  Vec3.copy(kPhysicsPosition, target);
 
   if (add) {
-    kTmpPos[side >> 1] += (side & 1) ? -1 : 1;
+    kPhysicsPosition[side >> 1] += (side & 1) ? -1 : 1;
     const intersect = env.movement.some(state => {
       const body = env.physics.get(state.id);
       if (!body) return false;
       const {max, min} = body;
       for (let i = 0; i < 3; i++) {
-        const pos = kTmpPos[i];
+        const pos = kPhysicsPosition[i];
         if (pos < max[i] && min[i] < pos + 1) continue;
         return false;
       }
@@ -551,7 +564,7 @@ const tryToModifyBlock =
     if (intersect) return;
   }
 
-  const x = int(kTmpPos[0]), y = int(kTmpPos[1]), z = int(kTmpPos[2]);
+  const x = int(kPhysicsPosition[0]), y = int(kPhysicsPosition[1]), z = int(kPhysicsPosition[2]);
   const block = add && env.blocks ? env.blocks.dirt : kEmptyBlock;
   modifyBlock(env, x, y, z, block, side);
 
@@ -752,10 +765,20 @@ const findPath = (env: TypedEnv, state: PathingState,
   //console.log(JSON.stringify(state.path));
 };
 
+/**
+ * PID (Proportional-Derivative) controller for smooth NPC movement.
+ *
+ * Uses error (distance from target) and derror (velocity) to compute
+ * corrective force. Stronger derivative term when airborne prevents overshoot.
+ */
 const PIDController =
     (error: number, derror: number, grounded: boolean): number => {
-  const dfactor = grounded ? 1.00 : 2.00;
-  return 20.00 * error + dfactor * derror;
+  const kProportionalGain = 20.0;  // Position error multiplier
+  const kDerivativeGrounded = 1.0; // Velocity damping when on ground
+  const kDerivativeAirborne = 2.0; // Stronger damping when airborne
+
+  const dfactor = grounded ? kDerivativeGrounded : kDerivativeAirborne;
+  return kProportionalGain * error + dfactor * derror;
 };
 
 const nextPathStep = (env: TypedEnv, state: PathingState,
@@ -777,12 +800,18 @@ const nextPathStep = (env: TypedEnv, state: PathingState,
   const z = use_soft ? soft[2] - 0.5 : node.z;
   const y = node.y;
 
+  // Epsilon values for position tolerance - how close entity must be to waypoint
+  const kFinalStepTolerance = 0.4;     // Final destination - tight tolerance
+  const kPrecisionStepTolerance = 0.1; // Precision required step - very tight
+  const kFirstStepTolerance = -0.6;    // Starting position - loose (can be outside)
+  const kNormalStepTolerance = -0.4;   // Regular waypoint - moderate tolerance
+
   const E = (() => {
     const width = max[0] - min[0];
     const final_path_step = path_index === path.length - 1;
-    if (final_path_step) return 0.4 * (1 - width);
-    if (needs_precision) return 0.1 * (1 - width);
-    return (path_index === 0 ? -0.6 : -0.4) * width;
+    if (final_path_step) return kFinalStepTolerance * (1 - width);
+    if (needs_precision) return kPrecisionStepTolerance * (1 - width);
+    return (path_index === 0 ? kFirstStepTolerance : kNormalStepTolerance) * width;
   })();
 
   const result = x + E <= min[0] && max[0] <= x + 1 - E &&
@@ -797,13 +826,13 @@ const nextPathStep = (env: TypedEnv, state: PathingState,
       };
 
       const check_move = (x: number, y: number, z: number) => {
-        Vec3.set(kTmpDelta, x, y, z);
-        sweep(kTmpMin, kTmpMax, kTmpDelta, kTmpResting, check, true);
-        return kTmpResting[0] || kTmpResting[1] || kTmpResting[2];
+        Vec3.set(kPhysicsDelta, x, y, z);
+        sweep(kPhysicsBoundsMin, kPhysicsBoundsMax, kPhysicsDelta, kPhysicsResting, check, true);
+        return kPhysicsResting[0] || kPhysicsResting[1] || kPhysicsResting[2];
       };
 
-      Vec3.copy(kTmpMax, body.max);
-      Vec3.copy(kTmpMin, body.min);
+      Vec3.copy(kPhysicsBoundsMax, body.max);
+      Vec3.copy(kPhysicsBoundsMin, body.min);
 
       const prev = path[path_index];
       const next = path[path_index + 1];

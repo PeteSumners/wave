@@ -106,7 +106,8 @@ const precomputeDiagonal = (x: int, z: int): Point[] => {
   return result;
 };
 
-const kDiagonalDistance = 5;
+// Diagonal pathfinding precomputation limits
+const kDiagonalDistance = 5;  // Maximum diagonal jump distance in blocks
 const kDiagonalArea = kDiagonalDistance * kDiagonalDistance;
 const kDiagonalScratch: boolean[] = new Array(kDiagonalArea).fill(true);
 const kDiagonalChecks: Point[][] = [];
@@ -119,7 +120,8 @@ for (let x = int(1); x < kDiagonalDistance; x++) {
   }
 }
 
-const kSweepDistance = 16;
+// Line-of-sight sweep distance for path simplification
+const kSweepDistance = 16;  // Maximum distance for direct path checks (blocks)
 const kSweeps: Point[][] = [];
 
 for (let z = int(0); z < kSweepDistance; z++) {
@@ -346,8 +348,11 @@ const AStarNeighbors =
 
     if (ny < next.y && grounded &&
         check(source.add(up)) && check(next.add(up))) {
-      const flat_limit = 4;
-      const jump_limit = 3;
+      // Jump distance limits for NPC pathfinding
+      const kFlatJumpDistance = 4;  // Maximum horizontal jump without height gain
+      const kHeightJumpDistance = 3; // Maximum jump distance when gaining height
+      const flat_limit = kFlatJumpDistance;
+      const jump_limit = kHeightJumpDistance;
       if (!diagonal) {
         for (let j = 0, jump = next; j < flat_limit; j++) {
           jump = jump.add(dir);

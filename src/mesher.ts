@@ -47,10 +47,11 @@ const pack_indices = (xs: int[]): int => {
 const kCachedGeometryA: Geometry = Geometry.empty();
 const kCachedGeometryB: Geometry = Geometry.empty();
 
-const kTmpPos = Vec3.create();
-const kTmpShape: [int, int, int] = [0, 0, 0];
-let kMaskData = new Int32Array();
-let kMaskUnion = new Int32Array();
+// Greedy meshing working buffers (reused across multiple mesh operations)
+const kQuadPosition = Vec3.create();           // Current quad position during meshing
+const kMeshingShape: [int, int, int] = [0, 0, 0];  // Temporary shape bounds
+let kGreedyMaskData = new Int32Array();        // 2D mask of mergeable faces
+let kGreedyMaskUnion = new Int32Array();       // Per-row union of mask values
 
 // Wave effect bitmask for liquid surface vertices.
 // Each 4-bit value indicates which quad vertices receive wave displacement.
@@ -62,18 +63,28 @@ const kWaveValues: int[] = [
   0b1100,  // Z-axis faces: wave vertices 2 and 3 (creates horizontal wave motion)
 ];
 
+// Triangle index patterns for quad tessellation
+// Each pattern defines how to split a quad (4 vertices) into 2 triangles (6 indices)
+// Pattern choice depends on ambient occlusion to minimize shading artifacts
+// A/B: Standard diagonal \ or / ; C/D: Flipped diagonal for better AO
 const kIndexOffsets = {
-  A: pack_indices([0, 1, 2, 0, 2, 3]),
-  B: pack_indices([1, 2, 3, 0, 1, 3]),
-  C: pack_indices([0, 2, 1, 0, 3, 2]),
-  D: pack_indices([3, 1, 0, 3, 2, 1]),
+  A: pack_indices([0, 1, 2, 0, 2, 3]),  // Triangle 1: 0→1→2, Triangle 2: 0→2→3
+  B: pack_indices([1, 2, 3, 0, 1, 3]),  // Triangle 1: 1→2→3, Triangle 2: 0→1→3
+  C: pack_indices([0, 2, 1, 0, 3, 2]),  // Triangle 1: 0→2→1, Triangle 2: 0→3→2
+  D: pack_indices([3, 1, 0, 3, 2, 1]),  // Triangle 1: 3→1→0, Triangle 2: 3→2→1
 };
 
+// Heightmap side face generation configuration
+// Each tuple defines parameters for generating vertical faces on terrain LOD meshes
+// Format: [u_axis, v_axis, d_axis, direction, y_offset, ao_pattern]
+// - u_axis/v_axis/d_axis: coordinate system mapping for this face
+// - direction: +1 or -1 to indicate positive/negative axis direction
+// - ao_pattern: ambient occlusion bit pattern for this face orientation
 const kHeightmapSides: [int, int, int, int, int, int][] = [
-  [0, 1, 2,  1,  0, int(0x82)],
-  [0, 1, 2, -1,  0, int(0x82)],
-  [2, 0, 1,  0,  1, int(0x06)],
-  [2, 0, 1,  0, -1, int(0x06)],
+  [0, 1, 2,  1,  0, int(0x82)],  // +Z face
+  [0, 1, 2, -1,  0, int(0x82)],  // -Z face
+  [2, 0, 1,  0,  1, int(0x06)],  // +X face
+  [2, 0, 1,  0, -1, int(0x06)],  // -X face
 ];
 
 class TerrainMesher {
@@ -228,15 +239,15 @@ class TerrainMesher {
 
     const {data, shape, stride} = voxels;
 
-    kTmpShape[0] = shape[0];
-    kTmpShape[1] = int(y_max - y_min);
-    kTmpShape[2] = shape[2];
+    kMeshingShape[0] = shape[0];
+    kMeshingShape[1] = int(y_max - y_min);
+    kMeshingShape[2] = shape[2];
 
     for (const d of [1, 0, 2] as (1 | 0 | 2)[]) {
       const face = int(d * 2);
       const v = (d === 1 ? 0 : 1);
       const u = 3 - d - v;
-      const ld = kTmpShape[d] - 1, lu = kTmpShape[u] - 2, lv = kTmpShape[v] - 2;
+      const ld = kMeshingShape[d] - 1, lu = kMeshingShape[u] - 2, lv = kMeshingShape[v] - 2;
       const sd = stride[d], su = stride[u], sv = stride[v];
       const base = su + sv + y_min * stride[1];
 
@@ -269,18 +280,18 @@ class TerrainMesher {
       const sv_fixed = d > 0 ? sv : su;
 
       const area = lu * lv;
-      if (kMaskData.length < area) {
-        kMaskData = new Int32Array(area);
+      if (kGreedyMaskData.length < area) {
+        kGreedyMaskData = new Int32Array(area);
       }
-      if (kMaskUnion.length < lu) {
-        kMaskUnion = new Int32Array(lu);
+      if (kGreedyMaskUnion.length < lu) {
+        kGreedyMaskUnion = new Int32Array(lu);
       }
 
       for (let id = 0; id < ld; id++) {
         let n = 0;
         let complete_union = 0;
         for (let iu = 0; iu < lu; iu++) {
-          kMaskUnion[iu] = 0;
+          kGreedyMaskUnion[iu] = 0;
           let index = base + id * sd + iu * su;
           for (let iv = 0; iv < lv; iv++, index += sv, n += 1) {
             // mask[n] is the face between (id, iu, iv) and (id + 1, iu, iv).
@@ -312,8 +323,8 @@ class TerrainMesher {
               : this.packAOMask(data, ix, nx, su_fixed, sv_fixed);
             const mask = (material << 9) | (dir > 0 ? 1 << 8 : 0) | ao;
 
-            kMaskData[n] = mask;
-            kMaskUnion[iu] |= mask;
+            kGreedyMaskData[n] = mask;
+            kGreedyMaskUnion[iu] |= mask;
             complete_union |= mask;
           }
         }
@@ -337,46 +348,46 @@ class TerrainMesher {
         if (d !== 1) {
           if (id === 0) {
             for (let i = 0; i < area; i++) {
-              if (!(kMaskData[i] & 0x100)) kMaskData[i] = 0;
+              if (!(kGreedyMaskData[i] & 0x100)) kGreedyMaskData[i] = 0;
             }
           } else if (id === ld - 1) {
             for (let i = 0; i < area; i++) {
-              if ((kMaskData[i] & 0x100)) kMaskData[i] = 0;
+              if ((kGreedyMaskData[i] & 0x100)) kGreedyMaskData[i] = 0;
             }
           }
         }
 
         n = 0;
         for (let iu = 0; iu < lu; iu++) {
-          if (kMaskUnion[iu] === 0) {
+          if (kGreedyMaskUnion[iu] === 0) {
             n += lv;
             continue;
           }
 
           let h = int(1);
           for (let iv = 0; iv < lv; iv += h, n += h) {
-            const mask = kMaskData[n];
+            const mask = kGreedyMaskData[n];
             if (mask === 0) {
               h = 1;
               continue;
             }
 
             for (h = int(1); h < lv - iv; h++) {
-              if (mask != kMaskData[n + h]) break;
+              if (mask != kGreedyMaskData[n + h]) break;
             }
 
             let w = int(1), nw = n + lv;
             OUTER:
             for (; w < lu - iu; w++, nw += lv) {
               for (let x = 0; x < h; x++) {
-                if (mask != kMaskData[nw + x]) break OUTER;
+                if (mask != kGreedyMaskData[nw + x]) break OUTER;
               }
             }
 
-            kTmpPos[d] = id;
-            kTmpPos[u] = iu;
-            kTmpPos[v] = iv;
-            kTmpPos[1] += y_min;
+            kQuadPosition[d] = id;
+            kQuadPosition[u] = iu;
+            kQuadPosition[v] = iv;
+            kQuadPosition[1] += y_min;
 
             const ao  = (mask & 0xff) as int;
             const dir = (mask & 0x100 ? 1 : -1) as int;
@@ -387,7 +398,7 @@ class TerrainMesher {
 
             if (material.liquid) {
               if (d === 1) {
-                const pos = kTmpPos;
+                const pos = kQuadPosition;
                 if (dir > 0) {
                   const wave = kWaveValues[d];
                   this.addQuad(geo, material, dir, ao, wave, d, w, h, pos);
@@ -399,25 +410,25 @@ class TerrainMesher {
                 const wave = kWaveValues[d];
                 if (h === lv - iv) {
                   this.addQuad(geo, material, dir, ao, wave,
-                               d, w_fixed, h_fixed, kTmpPos);
+                               d, w_fixed, h_fixed, kQuadPosition);
                 } else {
                   this.splitLiquidSideQuads(geo, material, voxels, dir, ao,
-                                            wave, d, w, h, kTmpPos);
+                                            wave, d, w, h, kQuadPosition);
                 }
               }
             } else {
               this.addQuad(geo, material, dir, ao, 0,
-                           d, w_fixed, h_fixed, kTmpPos);
+                           d, w_fixed, h_fixed, kQuadPosition);
               if (material.texture && material.texture.alphaTest) {
                 this.addQuad(geo, material, int(-dir), ao, 0,
-                             d, w_fixed, h_fixed, kTmpPos);
+                             d, w_fixed, h_fixed, kQuadPosition);
               }
             }
 
             nw = n;
             for (let wx = 0; wx < w; wx++, nw += lv) {
               for (let hx = 0; hx < h; hx++) {
-                kMaskData[nw + hx] = 0;
+                kGreedyMaskData[nw + hx] = 0;
               }
             }
           }
@@ -467,9 +478,9 @@ class TerrainMesher {
         for (x = int(x + 1); x < h; x++) {
           if (!patch(x, dz, face)) break;
         }
-        kTmpPos[0] = base_x + start;
-        kTmpPos[2] = base_z + Math.max(dz, 0);
-        this.addQuad(geo, material, 1, ao, wave, 2, x - start, 0, kTmpPos);
+        kQuadPosition[0] = base_x + start;
+        kQuadPosition[2] = base_z + Math.max(dz, 0);
+        this.addQuad(geo, material, 1, ao, wave, 2, x - start, 0, kQuadPosition);
       }
     }
 
@@ -482,9 +493,9 @@ class TerrainMesher {
         for (z = int(z + 1); z < w; z++) {
           if (!patch(dx, z, face)) break;
         }
-        kTmpPos[0] = base_x + Math.max(dx, 0);
-        kTmpPos[2] = base_z + start;
-        this.addQuad(geo, material, 1, ao, wave, 0, 0, z - start, kTmpPos);
+        kQuadPosition[0] = base_x + Math.max(dx, 0);
+        kQuadPosition[2] = base_z + start;
+        this.addQuad(geo, material, 1, ao, wave, 0, 0, z - start, kQuadPosition);
       }
     }
   }
@@ -517,8 +528,8 @@ class TerrainMesher {
       const w_fixed = d > 0 ? j - i : h;
       const h_fixed = d > 0 ? h : j - i;
       this.addQuad(geo, material, dir, ao, last ? wave : 0,
-                   d, w_fixed, h_fixed, kTmpPos);
-      kTmpPos[2 - d] += j - i;
+                   d, w_fixed, h_fixed, kQuadPosition);
+      kQuadPosition[2 - d] += j - i;
       last = !last;
       i = j - 1;
     }
@@ -557,11 +568,11 @@ class TerrainMesher {
           }
         }
 
-        Vec3.set(kTmpPos, x * scale, height, z * scale);
+        Vec3.set(kQuadPosition, x * scale, height, z * scale);
         const material = this.getMaterialData(id);
         const sw = scale * w, sh = scale * h;
         const wave = material.liquid ? 0b1111 : 0;
-        this.addQuad(geo, material, 1, 0, wave, 1, sw, sh, kTmpPos);
+        this.addQuad(geo, material, 1, 0, wave, 1, sw, sh, kQuadPosition);
 
         for (let wi = 0; wi < w; wi++) {
           let index = offset + stride * wi;
@@ -616,11 +627,11 @@ class TerrainMesher {
           const pz = d === 0 ? j * scale : i * scale;
           const wi = d === 0 ? height - neighbor : scale * w;
           const hi = d === 0 ? scale * w : height - neighbor;
-          Vec3.set(kTmpPos, px, neighbor, pz);
+          Vec3.set(kQuadPosition, px, neighbor, pz);
 
           const material = this.getMaterialData(id);
           const wave = material.liquid ? 0b1111 : 0;
-          this.addQuad(geo, material, dir, ao, wave, d, wi, hi, kTmpPos);
+          this.addQuad(geo, material, dir, ao, wave, d, wi, hi, kQuadPosition);
 
           const extra = w - 1;
           offset += extra * sj;
