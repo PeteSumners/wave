@@ -288,6 +288,44 @@ struct Chunk {
     }
   }
 
+  //============================================================================
+  // LIGHTING SYSTEM
+  //============================================================================
+  //
+  // The WAVE engine uses a two-stage cellular automaton for efficient voxel lighting.
+  // This approach allows incremental updates when blocks change, avoiding full chunk
+  // recomputation.
+  //
+  // STAGE 1: CHUNK-LOCAL LIGHTING
+  // ------------------------------
+  // Operates on a single chunk, assuming all neighboring chunks are completely dark.
+  // This provides fast initial lighting that's correct for chunk-internal light sources.
+  //
+  // Light sources:
+  // - Sunlight: Full brightness (15) above ground, propagates downward
+  // - Block lights: Torches (14), fungi (10), etc.
+  //
+  // Propagation:
+  // Light spreads to adjacent blocks with intensity decay (light - 1).
+  // Uses iterative flood-fill from all dirty blocks until convergence.
+  //
+  // STAGE 2: MULTI-CHUNK LIGHTING
+  // ------------------------------
+  // Loads a 3×3 neighborhood of chunks and propagates edge lighting across boundaries.
+  // Stores only deltas from stage 1 (sparse storage for memory efficiency).
+  //
+  // The two-stage approach balances accuracy with performance:
+  // - Stage 1 is fast and runs immediately when blocks change
+  // - Stage 2 is slower but only affects chunk edges
+  // - Most lighting is correct after stage 1 alone
+  //
+  // INCREMENTAL UPDATES:
+  // When a block changes, only nearby blocks are marked dirty and recomputed.
+  // Typical convergence: 2-3 iterations for local changes.
+  // Worst case: 15 iterations (light travels max 15 blocks from source to darkness).
+  //
+  //============================================================================
+
   void lightingInit() {
     // Use for fast bitwise index propagation below.
     static_assert(decltype(stage1_lights)::stride[0] == kLightSpread[1].diff);

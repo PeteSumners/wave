@@ -427,12 +427,15 @@ class Timing {
 
 //////////////////////////////////////////////////////////////////////////////
 
-const kTmpPos     = Vec3.create();
-const kTmpMin     = Vec3.create();
-const kTmpMax     = Vec3.create();
-const kTmpDelta   = Vec3.create();
-const kTmpImpacts = Vec3.create();
+const kSweepPosition = Vec3.create();
+const kSweepBoundsMin = Vec3.create();
+const kSweepBoundsMax = Vec3.create();
+const kSweepMovementDelta = Vec3.create();
+const kSweepCollisionImpacts = Vec3.create();
 
+// Minimum Z distance for near-plane clipping to prevent z-fighting.
+// Lower bound (0.001) allows very close-up detail without clipping.
+// Upper bound (0.1) provides sufficient detail while avoiding distant z-fighting.
 const kMinZLowerBound = 0.001;
 const kMinZUpperBound = 0.1;
 
@@ -443,8 +446,11 @@ const kChunkRadius = 12;
 const kFrontierRadius = 8;
 const kFrontierLevels = 6;
 
+// Maximum light level (15). Matches Minecraft's lighting system.
 const kSunlightLevel = 0xf;
 
+// Light attenuation factor: each light level reduces brightness by 20%.
+// This creates a natural exponential falloff from light sources.
 const lighting = (x: int): number => Math.pow(0.8, kSunlightLevel - x);
 
 class Env {
@@ -599,24 +605,24 @@ class Env {
 
     const shift_target = (delta: Vec3, bump: number) => {
       const buffer = kMinZUpperBound;
-      Vec3.set(kTmpMin, x - buffer, y - buffer + bump, z - buffer);
-      Vec3.set(kTmpMax, x + buffer, y + buffer + bump, z + buffer);
-      sweep(kTmpMin, kTmpMax, kTmpDelta, kTmpImpacts, check, true);
+      Vec3.set(kSweepBoundsMin, x - buffer, y - buffer + bump, z - buffer);
+      Vec3.set(kSweepBoundsMax, x + buffer, y + buffer + bump, z + buffer);
+      sweep(kSweepBoundsMin, kSweepBoundsMax, kSweepMovementDelta, kSweepCollisionImpacts, check, true);
 
-      Vec3.add(kTmpDelta, kTmpMin, kTmpMax);
-      Vec3.scale(kTmpDelta, kTmpDelta, 0.5);
-      Vec3.sub(kTmpDelta, kTmpDelta, target);
-      return Vec3.length(kTmpDelta);
+      Vec3.add(kSweepMovementDelta, kSweepBoundsMin, kSweepBoundsMax);
+      Vec3.scale(kSweepMovementDelta, kSweepMovementDelta, 0.5);
+      Vec3.sub(kSweepMovementDelta, kSweepMovementDelta, target);
+      return Vec3.length(kSweepMovementDelta);
     };
 
     const safe_zoom_at = (bump: number) => {
-      Vec3.scale(kTmpDelta, direction, -zoom);
-      return shift_target(kTmpDelta, bump);
+      Vec3.scale(kSweepMovementDelta, direction, -zoom);
+      return shift_target(kSweepMovementDelta, bump);
     };
 
     const max_bump = () => {
-      Vec3.set(kTmpDelta, 0, 0.5, 0);
-      return shift_target(kTmpDelta, 0);
+      Vec3.set(kSweepMovementDelta, 0, 0.5, 0);
+      return shift_target(kSweepMovementDelta, 0);
     };
 
     let limit = 1;
@@ -649,7 +655,7 @@ class Env {
       if (!this.registry.solid[block]) return true;
 
       let mask = 0;
-      const pos = kTmpPos;
+      const pos = kSweepPosition;
       Vec3.set(pos, x, y, z);
       for (let d = 0; d < 3; d++) {
         pos[d] += 1;
@@ -673,13 +679,13 @@ class Env {
     const y = Math.floor(target[1] * kSweepResolution) / kSweepResolution;
     const z = Math.floor(target[2] * kSweepResolution) / kSweepResolution;
 
-    Vec3.set(kTmpMin, x - buffer, y - buffer, z - buffer);
-    Vec3.set(kTmpMax, x + buffer, y + buffer, z + buffer);
-    Vec3.scale(kTmpDelta, direction, 10);
-    sweep(kTmpMin, kTmpMax, kTmpDelta, kTmpImpacts, check, true);
+    Vec3.set(kSweepBoundsMin, x - buffer, y - buffer, z - buffer);
+    Vec3.set(kSweepBoundsMax, x + buffer, y + buffer, z + buffer);
+    Vec3.scale(kSweepMovementDelta, direction, 10);
+    sweep(kSweepBoundsMin, kSweepBoundsMax, kSweepMovementDelta, kSweepCollisionImpacts, check, true);
 
     for (let i = 0; i < 3; i++) {
-      const impact = kTmpImpacts[i];
+      const impact = kSweepCollisionImpacts[i];
       if (impact === 0) continue;
       this.highlightSide = int(2 * i + (impact < 0 ? 0 : 1));
       break;

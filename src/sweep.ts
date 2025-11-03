@@ -12,6 +12,34 @@ const kSpeeds = [0, 0, 0, 0];
 const kDistances = [0, 0, 0, kSweepResolution];
 const kVoxel = Vec3.create();
 
+/**
+ * Performs continuous collision detection for an axis-aligned bounding box (AABB)
+ * moving through a voxel world.
+ *
+ * ALGORITHM: Swept AABB
+ * Uses fixed-point arithmetic (kSweepResolution = 4096 subpixels per block) for
+ * precise sub-voxel collision detection. The algorithm iteratively steps the AABB
+ * toward each axis-aligned voxel boundary, checking for collisions at each step.
+ *
+ * KEY FEATURES:
+ * - Continuous collision detection (no tunneling through thin walls)
+ * - Multi-axis collision handling (can slide along walls)
+ * - Sub-voxel precision prevents rounding errors
+ *
+ * COLLISION RESPONSE:
+ * When a collision is detected, the movement is truncated at the point of impact,
+ * and the collision normal is recorded in the impacts vector (-1, 0, or +1 per axis).
+ *
+ * USAGE:
+ * Common for player movement, entity physics, projectiles, and line-of-sight checks.
+ *
+ * @param min - AABB minimum corner (modified in-place to final position)
+ * @param max - AABB maximum corner (modified in-place to final position)
+ * @param delta - Desired movement vector (modified to actual movement achieved)
+ * @param impacts - Output: which faces collided (-1, 0, +1 per axis)
+ * @param check - Callback function to test if a voxel position is passable
+ * @param stop_on_impact - If true, stop immediately on first collision (optimization)
+ */
 const sweep = (min: Vec3, max: Vec3, delta: Vec3, impacts: Vec3,
                check: Check, stop_on_impact: boolean = false) => {
   for (let i = 0; i < 3; i++) {

@@ -201,6 +201,30 @@ const applyFriction = (axis: int, state: PhysicsState, dv: Vec3) => {
   state.vel[(axis + 2) % 3] *= scale;
 };
 
+/**
+ * Attempts to automatically step up small obstacles without jumping.
+ *
+ * Auto-stepping allows smooth movement up stairs and small ledges without
+ * requiring explicit jump input. This is a common FPS game mechanic.
+ *
+ * ALGORITHM:
+ * 1. Check if entity is moving primarily toward the obstacle (velocity threshold)
+ * 2. Check if step height is within auto-step range (0.0625 to 0.5 blocks)
+ * 3. Perform a "test sweep" with elevated position
+ * 4. If test sweep succeeds, apply the vertical position boost
+ *
+ * VELOCITY THRESHOLD:
+ * Only auto-step if moving mostly perpendicular to the obstacle face.
+ * This prevents unintended stepping when running parallel to walls.
+ * Threshold = 16 (primary velocity must be 16× secondary velocity).
+ *
+ * @param env - Game environment
+ * @param dt - Delta time
+ * @param state - Physics state of entity
+ * @param min - AABB minimum corner
+ * @param max - AABB maximum corner
+ * @param check - Voxel collision check function
+ */
 const tryAutoStepping =
     (env: TypedEnv, dt: number, state: PhysicsState, min: Vec3, max: Vec3,
      check: (x: int, y: int, z: int) => boolean) => {
@@ -209,6 +233,9 @@ const tryAutoStepping =
   const {resting, vel} = state;
   const {opaque, solid} = env.registry;
 
+  // Ratio of primary to secondary velocity components required for auto-stepping.
+  // Higher values (16) mean more direct movement toward obstacle is required to trigger step.
+  // This prevents unintended stepping when moving diagonally past edges.
   const threshold = 16;
   const speed_x = Math.abs(vel[0]);
   const speed_z = Math.abs(vel[2]);
@@ -330,8 +357,8 @@ const Physics = (env: TypedEnv): Component<PhysicsState> => ({
     friction: 0,
     restitution: 0,
     mass: 1,
-    autoStep: 0.0625,
-    autoStepMax: 0.5,
+    autoStep: 0.0625,      // 1/16 block - minimum step height to climb automatically (standard stair step)
+    autoStepMax: 0.5,      // 1/2 block - maximum step height before jump required (half-slab height)
   }),
   onAdd: (state: PhysicsState) => {
     setPhysicsFromPosition(env.position.getX(state.id), state);

@@ -243,12 +243,13 @@ const AStarHeapExtractMin = (heap: AStarHeap): AStarNode => {
 
 type Check = (p: Point) => boolean;
 
-const AStarDiagonalPenalty = 1;
-const AStarJumpPenalty = 2;
-const AStarUnitCost = 16;
-const AStarUpCost   = 64;
-const AStarDownCost = 4;
-const AStarLimit = int(256);
+// A* pathfinding cost values (tuned for natural-looking NPC movement)
+const ASTAR_COST_DIAGONAL_MOVE = 1;    // Slight penalty for diagonal movement
+const ASTAR_COST_JUMP_ACTION = 2;      // Cost of performing a jump
+const ASTAR_COST_HORIZONTAL_MOVE = 16; // Base cost for moving one block
+const ASTAR_COST_CLIMB_UP = 64;        // 4x horizontal - climbing is slow/expensive
+const ASTAR_COST_FALL_DOWN = 4;        // 0.25x horizontal - falling is fast/cheap
+const ASTAR_NODE_LIMIT = int(256);     // Maximum nodes to explore before giving up
 
 const AStarKey = (p: Point, source: Point): int => {
   const result = (((p.x - source.x) & 0x3ff) << 0) |
@@ -280,9 +281,9 @@ const AStarHeuristic = (source: Point, target: Point) => {
     const off = Math.sqrt(ox * ox + oy * oy + oz * oz);
 
     const ax = Math.abs(px), az = Math.abs(pz);
-    const base = Math.max(ax, az) * AStarUnitCost +
-                 Math.min(ax, az) * AStarDiagonalPenalty;
-    return base + off + py * (py > 0 ? AStarDownCost : -AStarUpCost);
+    const base = Math.max(ax, az) * ASTAR_COST_HORIZONTAL_MOVE +
+                 Math.min(ax, az) * ASTAR_COST_DIAGONAL_MOVE;
+    return base + off + py * (py > 0 ? ASTAR_COST_FALL_DOWN : -ASTAR_COST_CLIMB_UP);
   };
 };
 
@@ -396,9 +397,39 @@ const AStarNeighbors =
   return result;
 };
 
+/**
+ * Core A* pathfinding algorithm implementation.
+ *
+ * ALGORITHM: A* (A-star)
+ * Classic informed search algorithm that uses a heuristic to guide pathfinding.
+ * Maintains a priority queue (min-heap) of nodes to explore, prioritized by f = g + h:
+ * - g: actual cost from start to current node
+ * - h: estimated cost from current node to goal (heuristic)
+ *
+ * HEURISTIC: Non-admissible distance + direction preference
+ * Our heuristic overestimates cost slightly to prefer paths aligned with the goal
+ * direction. This produces more natural-looking NPC movement but sacrifices
+ * optimality guarantees. Trade-off is acceptable for game AI.
+ *
+ * FEATURES:
+ * - Jump support: Can plan paths with 1-3 block horizontal jumps
+ * - Diagonal movement: 8-directional pathfinding with corner obstacle checking
+ * - Grounded constraint: Paths follow terrain (no flying segments)
+ *
+ * COST TUNING:
+ * - Horizontal movement: 16 cost units
+ * - Climbing up: 64 cost units (4x - climbing is slow)
+ * - Falling down: 4 cost units (0.25x - falling is fast)
+ * - Jumping: +2 cost units penalty (slight preference to avoid jumps)
+ *
+ * @param source - Starting position in world coordinates (adjusted to ground level)
+ * @param target - Target position in world coordinates (adjusted to ground level)
+ * @param check - Function to test if a voxel position is passable
+ * @returns Array of waypoints from source to target, or empty array if no path found
+ */
 const AStarCore = (source: Point, target: Point, check: Check): Point[] => {
   let count = int(0);
-  const limit = AStarLimit;
+  const limit = ASTAR_NODE_LIMIT;
 
   const sy = AStarDrop(source, check);
   source = sy >= source.y - 1 ? AStarAdjust(source, sy) : source;
@@ -433,10 +464,10 @@ const AStarCore = (source: Point, target: Point, check: Check): Point[] => {
       const ax = Math.abs(next.x - cur.x);
       const az = Math.abs(next.z - cur.z);
       const distance = cur.distance +
-                       Math.max(ax, az) * AStarUnitCost +
-                       Math.min(ax, az) * AStarDiagonalPenalty +
-                       ((ax > 1 || az > 1) ? AStarJumpPenalty : 0) +
-                       dy * (dy > 0 ? AStarUpCost : -AStarDownCost);
+                       Math.max(ax, az) * ASTAR_COST_HORIZONTAL_MOVE +
+                       Math.min(ax, az) * ASTAR_COST_DIAGONAL_MOVE +
+                       ((ax > 1 || az > 1) ? ASTAR_COST_JUMP_ACTION : 0) +
+                       dy * (dy > 0 ? ASTAR_COST_CLIMB_UP : -ASTAR_COST_FALL_DOWN);
       const key = AStarKey(next, source);
       const existing = map.get(key);
 
@@ -476,6 +507,23 @@ const AStarCore = (source: Point, target: Point, check: Check): Point[] => {
 };
 
 
+/**
+ * A* pathfinding algorithm for voxel world navigation (high-level wrapper).
+ *
+ * This function wraps AStarCore to provide additional features:
+ * - Automatic height adjustment (drops entities to ground level)
+ * - Path simplification (removes unnecessary waypoints using line-of-sight)
+ * - Jump detection and marking (identifies which nodes require jumping)
+ *
+ * PATH SIMPLIFICATION:
+ * Uses line-of-sight checks to remove intermediate waypoints, producing more
+ * direct paths. Could be further improved with dynamic programming (see NOTE).
+ *
+ * @param source - Starting position in world coordinates
+ * @param target - Target position in world coordinates
+ * @param check - Function to test if a voxel position is passable
+ * @returns Array of PathNode waypoints from source to target, or empty array if no path found
+ */
 const AStar = (source: Point, target: Point, check: Check): PathNode[] => {
   //console.log(`AStar: ${source.toString()} -> ${target.toString()}`);
 
