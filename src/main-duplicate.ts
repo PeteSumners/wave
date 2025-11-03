@@ -1,0 +1,1488 @@
+import {assert, int, nonnull, Color, Vec3} from './base.js';
+import {BlockId, Env, init} from './engine.js';
+import {kEmptyBlock, kNoMaterial, kWorldHeight} from './engine.js';
+import {Component, ComponentState, ComponentStore} from './ecs.js';
+import {EntityId, kNoEntity} from './ecs.js';
+import {AStar, Check, PathNode, Point as AStarPoint} from './pathing.js';
+import {SpriteMesh, ShadowMesh, Texture} from './renderer.js';
+import {sweep} from './sweep.js';
+
+//////////////////////////////////////////////////////////////////////////////
+// SCENE MODIFICATIONS - DUPLICATE FILE FOR MODDING
+// Date: 2025-11-02
+// Modification: Added terrain modification functions near spawn point
+//
+// This is a DUPLICATE of main.ts for safe modding. The original engine
+// file (main.ts) remains unchanged. All scene modifications are made here.
+//
+// Changes:
+// - Lines 1287-1323: createFlatPlatform() - 9x9 grass platform at spawn
+// - Lines 1327-1373: createHill() - Smooth hill 5 blocks east+south
+// - Lines 1377-1426: createPond() - Water pond 6 blocks west
+// - Lines 1430-1455: createPath() - Stone path heading north from spawn
+// - Line 1462: Active terrain mod (switch by commenting/uncommenting)
+//
+// Purpose:
+// - Demonstrate terrain manipulation techniques
+// - Show distance-based height calculations (circular shapes)
+// - Illustrate multi-layer terrain building (stone→dirt→grass)
+// - Create recognizable spawn area modifications
+//
+// How to Use:
+// 1. Uncomment ONE terrain mod function call (lines 1462-1465)
+// 2. Run: ./scripts/build
+// 3. Refresh browser to see changes
+// 4. Try combining multiple mods for complex terrain!
+//////////////////////////////////////////////////////////////////////////////
+
+// Particle system configuration
+const kNumParticles = 16;        // Particles spawned per block break
+const kMaxNumParticles = 64;     // Maximum concurrent particles (performance limit)
+
+// Water flow simulation timing (milliseconds between flow iterations)
+const kWaterDelay = 200;
+const kWaterDisplacements = [
+  [1, 0, 0],
+  [0, 1, 0],
+  [0, 0, 1],
+  [-1, 0, 0],
+  [0, 0, -1],
+];
+
+type Point = [int, int, int];
+type Position = [number, number, number];
+
+interface Blocks {
+  bedrock: BlockId,
+  bush:    BlockId,
+  dirt:    BlockId,
+  fungi:   BlockId,
+  grass:   BlockId,
+  rock:    BlockId,
+  sand:    BlockId,
+  snow:    BlockId,
+  stone:   BlockId,
+  trunk:   BlockId,
+  water:   BlockId,
+};
+
+//////////////////////////////////////////////////////////////////////////////
+
+class TypedEnv extends Env {
+  particles: int = 0;
+  blocks: Blocks | null = null;
+  point_lights: Map<string, PointLight>;
+  lifetime: ComponentStore<LifetimeState>;
+  position: ComponentStore<PositionState>;
+  movement: ComponentStore<MovementState>;
+  pathing: ComponentStore<PathingState>;
+  physics: ComponentStore<PhysicsState>;
+  meshes: ComponentStore<MeshState>;
+  shadow: ComponentStore<ShadowState>;
+  inputs: ComponentStore<InputState>;
+  lights: ComponentStore<LightState>;
+  target: ComponentStore;
+
+  constructor(id: string) {
+    super(id);
+    const ents = this.entities;
+    this.point_lights = new Map();
+    this.lifetime = ents.registerComponent('lifetime', Lifetime);
+    this.position = ents.registerComponent('position', Position);
+    this.inputs = ents.registerComponent('inputs', Inputs(this));
+    this.pathing = ents.registerComponent('pathing', Pathing(this));
+    this.movement = ents.registerComponent('movement', Movement(this));
+    this.physics = ents.registerComponent('physics', Physics(this));
+    this.meshes = ents.registerComponent('meshes', Meshes(this));
+    this.shadow = ents.registerComponent('shadow', Shadow(this));
+    this.lights = ents.registerComponent('lights', Lights(this));
+    this.target = ents.registerComponent('camera-target', CameraTarget(this));
+  }
+};
+
+const hasWaterNeighbor = (env: TypedEnv, water: BlockId, p: Point) => {
+  for (const d of kWaterDisplacements) {
+    const x = int(d[0] + p[0]), y = int(d[1] + p[1]), z = int(d[2] + p[2]);
+    const block = env.getBlock(x, y, z);
+    if (block === water) return true;
+  }
+  return false;
+};
+
+const flowWater = (env: TypedEnv, water: BlockId, points: Point[]) => {
+  const next: Point[] = [];
+  const visited: Set<string> = new Set();
+
+  for (const p of points) {
+    const block = env.getBlock(p[0], p[1], p[2]);
+    if (block !== kEmptyBlock || !hasWaterNeighbor(env, water, p)) continue;
+    env.setBlock(p[0], p[1], p[2], water);
+    for (const d of kWaterDisplacements) {
+      const n: Point = [int(p[0] - d[0]), int(p[1] - d[1]), int(p[2] - d[2])];
+      const key = `${n[0]},${n[1]},${n[2]}`;
+      if (visited.has(key)) continue;
+      visited.add(key);
+      next.push(n);
+    }
+  }
+
+  if (next.length === 0) return;
+  setTimeout(() => flowWater(env, water, next), kWaterDelay);
+};
+
+//////////////////////////////////////////////////////////////////////////////
+
+// An entity with a lifetime calls cleanup() at the end of its life.
+
+interface LifetimeState {
+  id: EntityId,
+  index: int,
+  lifetime: number,
+  cleanup: (() => void) | null,
+};
+
+const Lifetime: Component<LifetimeState> = {
+  init: () => ({id: kNoEntity, index: 0, lifetime: 0, cleanup: null}),
+  onUpdate: (dt: number, states: LifetimeState[]) => {
+    for (const state of states) {
+      state.lifetime -= dt;
+      if (state.lifetime < 0 && state.cleanup) state.cleanup();
+    }
+  },
+};
+
+// An entity with a position is an axis-aligned bounding box (AABB) centered
+// at (x, y, z), with x- and z-extents equal to w and y-extent equal to h.
+
+interface PositionState {
+  id: EntityId,
+  index: int,
+  x: number,
+  y: number,
+  z: number,
+  h: number,
+  w: number,
+};
+
+const Position: Component<PositionState> = {
+  init: () => ({id: kNoEntity, index: 0, x: 0, y: 0, z: 0, h: 0, w: 0}),
+};
+
+// An entity's physics state tracks its location and velocity, and allows
+// other systems to apply forces and impulses to it. It updates the entity's
+// AABB and keeps its position in sync.
+
+interface PhysicsState {
+  id: EntityId,
+  index: int,
+  min: Vec3,
+  max: Vec3,
+  vel: Vec3,
+  forces: Vec3,
+  impulses: Vec3,
+  resting: Vec3,
+  inFluid: boolean,
+  inGrass: boolean,
+  friction: number,
+  restitution: number,
+  mass: number,
+  autoStep: number,
+  autoStepMax: number,
+};
+
+// Physics constants
+const kGravityAcceleration = Vec3.from(0, -40, 0);  // Gravity: 40 units/sec² downward
+
+// Physics working buffers (reused across physics calculations for performance)
+const kPhysicsAcceleration = Vec3.create();  // Accumulated acceleration per frame
+const kPhysicsFriction = Vec3.create();      // Friction force calculations
+const kPhysicsDelta = Vec3.create();         // Movement/velocity deltas
+const kPhysicsSize = Vec3.create();          // Entity size calculations
+const kMovementForce = Vec3.create();        // Movement input force
+const kPhysicsBoundsMax = Vec3.create();     // AABB max corner for collision tests
+const kPhysicsBoundsMin = Vec3.create();     // AABB min corner for collision tests
+const kPhysicsPosition = Vec3.create();      // Temporary position calculations
+const kPhysicsResting = Vec3.create();       // Collision resting state per axis
+
+const setPhysicsFromPosition = (a: PositionState, b: PhysicsState) => {
+  Vec3.set(kPhysicsPosition, a.x, a.y, a.z);
+  Vec3.set(kPhysicsSize, a.w / 2, a.h / 2, a.w / 2);
+  Vec3.sub(b.min, kPhysicsPosition, kPhysicsSize);
+  Vec3.add(b.max, kPhysicsPosition, kPhysicsSize);
+};
+
+const setPositionFromPhysics = (a: PositionState, b: PhysicsState) => {
+  a.x = (b.min[0] + b.max[0]) / 2;
+  a.y = (b.min[1] + b.max[1]) / 2;
+  a.z = (b.min[2] + b.max[2]) / 2;
+};
+
+const applyFriction = (axis: int, state: PhysicsState, dv: Vec3) => {
+  const resting = state.resting[axis];
+  if (resting === 0 || resting * dv[axis] <= 0) return;
+
+  Vec3.copy(kPhysicsFriction, state.vel);
+  kPhysicsFriction[axis] = 0;
+  const length = Vec3.length(kPhysicsFriction);
+  if (length === 0) return;
+
+  const loss = Math.abs(state.friction * dv[axis]);
+  const scale = length < loss ? 0 : (length - loss) / length;
+  state.vel[(axis + 1) % 3] *= scale;
+  state.vel[(axis + 2) % 3] *= scale;
+};
+
+/**
+ * Attempts to automatically step up small obstacles without jumping.
+ *
+ * Auto-stepping allows smooth movement up stairs and small ledges without
+ * requiring explicit jump input. This is a common FPS game mechanic.
+ *
+ * ALGORITHM:
+ * 1. Check if entity is moving primarily toward the obstacle (velocity threshold)
+ * 2. Check if step height is within auto-step range (0.0625 to 0.5 blocks)
+ * 3. Perform a "test sweep" with elevated position
+ * 4. If test sweep succeeds, apply the vertical position boost
+ *
+ * VELOCITY THRESHOLD:
+ * Only auto-step if moving mostly perpendicular to the obstacle face.
+ * This prevents unintended stepping when running parallel to walls.
+ * Threshold = 16 (primary velocity must be 16× secondary velocity).
+ *
+ * @param env - Game environment
+ * @param dt - Delta time
+ * @param state - Physics state of entity
+ * @param min - AABB minimum corner
+ * @param max - AABB maximum corner
+ * @param check - Voxel collision check function
+ */
+const tryAutoStepping =
+    (env: TypedEnv, dt: number, state: PhysicsState, min: Vec3, max: Vec3,
+     check: (x: int, y: int, z: int) => boolean) => {
+  if (state.resting[1] > 0 && !state.inFluid) return;
+
+  const {resting, vel} = state;
+  const {opaque, solid} = env.registry;
+
+  // Ratio of primary to secondary velocity components required for auto-stepping.
+  // Higher values (16) mean more direct movement toward obstacle is required to trigger step.
+  // This prevents unintended stepping when moving diagonally past edges.
+  const threshold = 16;
+  const speed_x = Math.abs(vel[0]);
+  const speed_z = Math.abs(vel[2]);
+
+  const step_x = (() => {
+    if (resting[0] === 0) return false;
+    if (threshold * speed_x <= speed_z) return false;
+    const x = int(Math.floor(vel[0] > 0 ? max[0] + 0.5 : min[0] - 0.5));
+    const y = int(Math.floor(min[1]));
+    const z = int(Math.floor((min[2] + max[2]) / 2));
+    const block = env.getBlock(x, y, z);
+    return opaque[block] && solid[block];
+  })();
+  const step_z = (() => {
+    if (resting[2] === 0) return false;
+    if (threshold * speed_z <= speed_x) return false;
+    const x = int(Math.floor((min[0] + max[0]) / 2));
+    const y = int(Math.floor(min[1]));
+    const z = int(Math.floor(vel[2] > 0 ? max[2] + 0.5 : min[2] - 0.5));
+    const block = env.getBlock(x, y, z);
+    return opaque[block] && solid[block];
+  })();
+  if (!step_x && !step_z) return;
+
+  const height = 1 - min[1] + Math.floor(min[1]);
+  if (height > state.autoStepMax) return;
+
+  Vec3.set(kPhysicsDelta, 0, height, 0);
+  sweep(min, max, kPhysicsDelta, kPhysicsResting, check);
+  if (kPhysicsResting[1] !== 0) return;
+
+  Vec3.scale(kPhysicsDelta, state.vel, dt);
+  kPhysicsDelta[1] = 0;
+  sweep(min, max, kPhysicsDelta, kPhysicsResting, check);
+  if (min[0] === state.min[0] && min[2] === state.min[2]) return;
+
+  if (height > state.autoStep) {
+    Vec3.set(kPhysicsDelta, 0, state.autoStep, 0);
+    sweep(state.min, state.max, kPhysicsDelta, state.resting, check);
+    if (!step_x) state.vel[0] = 0;
+    if (!step_z) state.vel[2] = 0;
+    state.vel[1] = 0;
+    return;
+  }
+
+  Vec3.copy(state.min, min);
+  Vec3.copy(state.max, max);
+  Vec3.copy(state.resting, kPhysicsResting);
+};
+
+const runPhysics = (env: TypedEnv, dt: number, state: PhysicsState) => {
+  if (state.mass <= 0) return;
+
+  const check = (x: int, y: int, z: int) => {
+    const block = env.getBlock(x, y, z);
+    return !env.registry.solid[block];
+  };
+
+  const {min, max} = state;
+  const x = int(Math.floor((min[0] + max[0]) / 2));
+  const y = int(Math.floor(min[1]));
+  const z = int(Math.floor((min[2] + max[2]) / 2));
+
+  const block = env.getBlock(x, y, z);
+  const mesh = env.registry.getBlockMesh(block);
+  state.inFluid = block !== kEmptyBlock && mesh === null;
+  state.inGrass = block === nonnull(env.blocks).bush;
+
+  // Fluid dynamics - drag reduces velocity, gravity is weakened underwater
+  const kFluidDrag = 2;              // Drag coefficient for liquids
+  const kFluidGravityMultiplier = 0.25;  // Gravity is 1/4 strength in water (buoyancy)
+
+  const drag = state.inFluid ? kFluidDrag : 0;
+  const left = Math.max(1 - drag * dt, 0);
+  const gravity = state.inFluid ? kFluidGravityMultiplier : 1;
+
+  Vec3.scale(kPhysicsAcceleration, state.forces, 1 / state.mass);
+  Vec3.scaleAndAdd(kPhysicsAcceleration, kPhysicsAcceleration, kGravityAcceleration, gravity);
+  Vec3.scale(kPhysicsDelta, kPhysicsAcceleration, dt);
+  Vec3.scaleAndAdd(kPhysicsDelta, kPhysicsDelta, state.impulses, 1 / state.mass);
+  if (state.friction) {
+    Vec3.add(kPhysicsAcceleration, kPhysicsDelta, state.vel);
+    applyFriction(0, state, kPhysicsAcceleration);
+    applyFriction(1, state, kPhysicsAcceleration);
+    applyFriction(2, state, kPhysicsAcceleration);
+  }
+
+  if (state.autoStep) {
+    Vec3.copy(kPhysicsBoundsMax, state.max);
+    Vec3.copy(kPhysicsBoundsMin, state.min);
+  }
+
+  // Update our state based on the computations above.
+  Vec3.add(state.vel, state.vel, kPhysicsDelta);
+  Vec3.scale(state.vel, state.vel, left);
+  Vec3.scale(kPhysicsDelta, state.vel, dt);
+  sweep(state.min, state.max, kPhysicsDelta, state.resting, check);
+  Vec3.set(state.forces, 0, 0, 0);
+  Vec3.set(state.impulses, 0, 0, 0);
+
+  if (state.autoStep) {
+    tryAutoStepping(env, dt, state, kPhysicsBoundsMin, kPhysicsBoundsMax, check);
+  }
+
+  for (let i = 0; i < 3; i++) {
+    if (state.resting[i] === 0) continue;
+    state.vel[i] = -state.restitution * state.vel[i];
+  }
+};
+
+const Physics = (env: TypedEnv): Component<PhysicsState> => ({
+  init: () => ({
+    id: kNoEntity,
+    index: 0,
+    min: Vec3.create(),
+    max: Vec3.create(),
+    vel: Vec3.create(),
+    forces: Vec3.create(),
+    impulses: Vec3.create(),
+    resting: Vec3.create(),
+    inFluid: false,
+    inGrass: false,
+    friction: 0,
+    restitution: 0,
+    mass: 1,
+    autoStep: 0.0625,      // 1/16 block - minimum step height to climb automatically (standard stair step)
+    autoStepMax: 0.5,      // 1/2 block - maximum step height before jump required (half-slab height)
+  }),
+  onAdd: (state: PhysicsState) => {
+    setPhysicsFromPosition(env.position.getX(state.id), state);
+  },
+  onRemove: (state: PhysicsState) => {
+    const position = env.position.get(state.id);
+    if (position) setPositionFromPhysics(position, state);
+  },
+  onUpdate: (dt: number, states: PhysicsState[]) => {
+    for (const state of states) {
+      runPhysics(env, dt, state);
+      setPositionFromPhysics(env.position.getX(state.id), state);
+    }
+  },
+});
+
+// Movement allows an entity to process inputs and attempt to move.
+
+interface MovementState {
+  id: EntityId,
+  index: int,
+  inputX: number,
+  inputZ: number,
+  jumping: boolean,
+  hovering: boolean,
+  maxSpeed: number,
+  moveForce: number,
+  grassPenalty: number,
+  waterPenalty: number,
+  responsiveness: number,
+  runningFriction: number,
+  standingFriction: number,
+  airMoveMultiplier: number,
+  airJumps: number,
+  jumpTime: number,
+  jumpForce: number,
+  jumpImpulse: number,
+  _jumped: boolean,
+  _jumpCount: number,
+  _jumpTimeLeft: number,
+  hoverFallForce: number,
+  hoverRiseForce: number,
+};
+
+const movementPenalty = (state: MovementState, body: PhysicsState): number => {
+  return body.inFluid ? state.waterPenalty :
+         body.inGrass ? state.grassPenalty : 1;
+}
+
+const handleJumping = (dt: number, state: MovementState,
+                       body: PhysicsState, grounded: boolean) => {
+  if (state._jumped) {
+    if (state._jumpTimeLeft <= 0) return;
+    const delta = state._jumpTimeLeft <= dt ? state._jumpTimeLeft / dt : 1;
+    const force = state.jumpForce * delta;
+    state._jumpTimeLeft -= dt;
+    body.forces[1] += force;
+    return;
+  }
+
+  const hasAirJumps = state._jumpCount < state.airJumps;
+  const canJump = grounded || body.inFluid || hasAirJumps;
+  if (!canJump) return;
+
+  const height = body.min[1];
+  const factor = height / kWorldHeight;
+  const density = factor > 1 ? Math.exp(1 - factor) : 1;
+  const penalty = density * (body.inFluid ? state.waterPenalty : 1);
+
+  state._jumped = true;
+  state._jumpTimeLeft = state.jumpTime;
+  body.impulses[1] += state.jumpImpulse * penalty;
+  if (grounded) return;
+
+  body.vel[1] = Math.max(body.vel[1], 0);
+  state._jumpCount++;
+};
+
+const handleRunning = (dt: number, state: MovementState,
+                       body: PhysicsState, grounded: boolean) => {
+  const penalty = movementPenalty(state, body);
+  const speed = penalty * state.maxSpeed;
+  Vec3.set(kPhysicsDelta, state.inputX * speed, 0, state.inputZ * speed);
+  Vec3.sub(kMovementForce, kPhysicsDelta, body.vel);
+  kMovementForce[1] = 0;
+  const length = Vec3.length(kMovementForce);
+  if (length === 0) return;
+
+  const bound = state.moveForce * (grounded ? 1 : state.airMoveMultiplier);
+  const input = state.responsiveness * length;
+  Vec3.scale(kMovementForce, kMovementForce, Math.min(bound, input) / length);
+  Vec3.add(body.forces, body.forces, kMovementForce);
+};
+
+const generateParticles =
+    (env: TypedEnv, block: BlockId, x: int, y: int, z: int, side: int) => {
+  const texture = (() => {
+    const mesh = env.registry.getBlockMesh(block);
+    if (mesh) {
+      const {frame, sprite: {url, x: w, y: h}} = mesh;
+      const x = frame % w, y = Math.floor(frame / w);
+      return {alphaTest: true, sparkle: false, url, x, y, w, h};
+    }
+    const adjusted = side === 2 || side === 3 ? 0 : side;
+    const material = env.registry.getBlockFaceMaterial(block, adjusted);
+    if (material === kNoMaterial) return;
+    return env.registry.getMaterialData(material).texture;
+  })();
+  if (!texture) return;
+
+  const count = Math.min(kNumParticles, kMaxNumParticles - env.particles);
+  env.particles += count;
+
+  for (let i = 0; i < count; i++) {
+    const particle = env.entities.addEntity();
+    const position = env.position.add(particle);
+
+    const size = Math.floor(3 * Math.random() + 1) / 16;
+    position.x = x + (1 - size) * Math.random() + size / 2;
+    position.y = y + (1 - size) * Math.random() + size / 2;
+    position.z = z + (1 - size) * Math.random() + size / 2;
+    position.w = position.h = size;
+
+    // Particle physics - random velocities for scatter effect
+    const kParticleSpeed = 8;         // Base velocity for block break particles
+    const kParticleFriction = 10;     // High friction for quick settle
+    const kParticleRestitution = 0.5; // Bounce coefficient (50% energy retention)
+
+    const body = env.physics.add(particle);
+    body.impulses[0] = kParticleSpeed * (Math.random() - 0.5);
+    body.impulses[1] = kParticleSpeed * Math.random();
+    body.impulses[2] = kParticleSpeed * (Math.random() - 0.5);
+    body.friction = kParticleFriction;
+    body.restitution = kParticleRestitution;
+
+    const mesh = env.meshes.add(particle);
+    const sprite = {url: texture.url, x: texture.w, y: texture.h};
+    mesh.mesh = env.renderer.addSpriteMesh(size, sprite);
+    mesh.mesh.setFrame(int(texture.x + texture.y * texture.w));
+
+    const epsilon = 0.01;
+    const s = Math.floor(16 * (1 - size) * Math.random()) / 16;
+    const t = Math.floor(16 * (1 - size) * Math.random()) / 16;
+    const uv = size - 2 * epsilon;
+    mesh.mesh.setSTUV(s + epsilon, t + epsilon, uv, uv);
+
+    const lifetime = env.lifetime.add(particle);
+    lifetime.lifetime = 1.0 * Math.random() + 0.5;
+    lifetime.cleanup = () => {
+      env.entities.removeEntity(particle);
+      env.particles--;
+    };
+  }
+};
+
+const modifyBlock = (env: TypedEnv, x: int, y: int, z: int,
+                     block: BlockId, side: int): void => {
+  const old_block = env.getBlock(x, y, z);
+  env.setBlock(x, y, z, block);
+  const new_block = env.getBlock(x, y, z);
+
+  if (env.blocks) {
+    const water = env.blocks.water;
+    setTimeout(() => flowWater(env, water, [[x, y, z]]), kWaterDelay);
+  }
+
+  if (old_block !== kEmptyBlock && old_block !== new_block &&
+      !(env.blocks && old_block === env.blocks.water)) {
+    generateParticles(env, old_block, x, y, z, side);
+  }
+};
+
+const tryToModifyBlock =
+    (env: TypedEnv, body: PhysicsState, add: boolean) => {
+  const target = env.getTargetedBlock();
+  if (target === null) return;
+
+  const side = env.getTargetedBlockSide();
+  Vec3.copy(kPhysicsPosition, target);
+
+  if (add) {
+    kPhysicsPosition[side >> 1] += (side & 1) ? -1 : 1;
+    const intersect = env.movement.some(state => {
+      const body = env.physics.get(state.id);
+      if (!body) return false;
+      const {max, min} = body;
+      for (let i = 0; i < 3; i++) {
+        const pos = kPhysicsPosition[i];
+        if (pos < max[i] && min[i] < pos + 1) continue;
+        return false;
+      }
+      return true;
+    });
+    if (intersect) return;
+  }
+
+  const x = int(kPhysicsPosition[0]), y = int(kPhysicsPosition[1]), z = int(kPhysicsPosition[2]);
+  const block = add && env.blocks ? env.blocks.dirt : kEmptyBlock;
+  modifyBlock(env, x, y, z, block, side);
+
+  if (block === kEmptyBlock) {
+    for (let dy = 1; dy < 8; dy++) {
+      const above = env.getBlock(x, int(y + dy), z);
+      if (env.registry.getBlockMesh(above) === null) break;
+      modifyBlock(env, x, int(y + dy), z, block, side);
+    }
+  }
+};
+
+const runMovement = (env: TypedEnv, dt: number, state: MovementState) => {
+  const body = env.physics.getX(state.id);
+  const grounded = body.resting[1] < 0;
+  if (grounded) state._jumpCount = 0;
+
+  if (state.hovering) {
+    const force = body.vel[1] < 0 ? state.hoverFallForce : state.hoverRiseForce;
+    body.forces[1] += force;
+  }
+
+  if (state.jumping) {
+    handleJumping(dt, state, body, grounded);
+    state.jumping = false;
+  } else {
+    state._jumped = false;
+  }
+
+  if (state.inputX || state.inputZ) {
+    handleRunning(dt, state, body, grounded);
+    body.friction = state.runningFriction;
+    state.inputX = state.inputZ = 0;
+  } else {
+    body.friction = state.standingFriction;
+  }
+};
+
+const Movement = (env: TypedEnv): Component<MovementState> => ({
+  init: () => ({
+    id: kNoEntity,
+    index: 0,
+    inputX: 0,
+    inputZ: 0,
+    jumping: false,
+    hovering: false,
+    maxSpeed: 7.5,
+    moveForce: 30,
+    grassPenalty: 0.5,
+    waterPenalty: 0.5,
+    responsiveness: 15,
+    runningFriction: 0,
+    standingFriction: 2,
+    airMoveMultiplier: 0.5,
+    airJumps: 0,
+    jumpTime: 0.2,
+    jumpForce: 10,
+    jumpImpulse: 7.5,
+    _jumped: false,
+    _jumpCount: 0,
+    _jumpTimeLeft: 0,
+    hoverFallForce: 160,
+    hoverRiseForce: 80,
+  }),
+  onUpdate: (dt: number, states: MovementState[]) => {
+    for (const state of states) runMovement(env, dt, state);
+  }
+});
+
+// An entity with an input component processes inputs.
+
+interface InputState {
+  id: EntityId,
+  index: int,
+  lastHeading: number;
+};
+
+const runInputs = (env: TypedEnv, state: InputState) => {
+  const movement = env.movement.get(state.id);
+  if (!movement) return;
+
+  // Process the inputs to get a heading, running, and jumping state.
+  const inputs = env.getMutableInputs();
+  const fb = (inputs.up ? 1 : 0) - (inputs.down ? 1 : 0);
+  const lr = (inputs.right ? 1 : 0) - (inputs.left ? 1 : 0);
+  movement.jumping = inputs.space;
+  movement.hovering = inputs.hover;
+
+  if (fb || lr) {
+    let heading = env.renderer.camera.heading;
+    if (fb) {
+      if (fb === -1) heading += Math.PI;
+      heading += fb * lr * Math.PI / 4;
+    } else {
+      heading += lr * Math.PI / 2;
+    }
+    movement.inputX = Math.sin(heading);
+    movement.inputZ = Math.cos(heading);
+    state.lastHeading = heading;
+
+    const mesh = env.meshes.get(state.id);
+    if (mesh) {
+      const row = mesh.row;
+      const option_a = fb > 0 ? 0 : fb < 0 ? 2 : -1;
+      const option_b = lr > 0 ? 3 : lr < 0 ? 1 : -1;
+      if (row !== option_a && row !== option_b) {
+        mesh.row = Math.max(option_a, option_b);
+      }
+    }
+  }
+
+  // Call any followers.
+  const body = env.physics.get(state.id);
+  if (body && (inputs.call || true)) {
+    const {min, max} = body;
+    const heading = state.lastHeading;
+    const multiplier = (fb || lr) ? 1.5 : 2.0;
+    const kFollowDistance = multiplier * (max[0] - min[0]);
+    const x = (min[0] + max[0]) / 2 - kFollowDistance * Math.sin(heading);
+    const z = (min[2] + max[2]) / 2 - kFollowDistance * Math.cos(heading);
+    const y = (min[1] + body.autoStepMax);
+
+    const ix = int(Math.floor(x));
+    const iy = int(Math.floor(y));
+    const iz = int(Math.floor(z));
+
+    env.pathing.each(other => {
+      other.target = [ix, iy, iz];
+      other.soft_target = [x, y, z];
+    });
+  }
+  inputs.call = false;
+
+  // Turn mouse inputs into actions.
+  if (inputs.mouse0 || inputs.mouse1) {
+    const body = env.physics.get(state.id);
+    if (body) tryToModifyBlock(env, body, !inputs.mouse0);
+    inputs.mouse0 = false;
+    inputs.mouse1 = false;
+  }
+};
+
+const Inputs = (env: TypedEnv): Component<InputState> => ({
+  init: () => ({id: kNoEntity, index: 0, lastHeading: 0}),
+  onUpdate: (dt: number, states: InputState[]) => {
+    for (const state of states) runInputs(env, state);
+  }
+});
+
+// An entity with PathingState computes a path to a target and moves along it.
+
+interface PathingState {
+  id: EntityId,
+  index: int,
+  // Current path:
+  path: PathNode[] | null,
+  path_index: int,
+  path_soft_target: Position | null,
+  path_needs_precision: boolean[] | null,
+  // Next path request:
+  target: Point | null,
+  soft_target: Position | null,
+};
+
+const solid = (env: TypedEnv, x: int, y: int, z: int): boolean => {
+  const block = env.getBlock(x, y, z);
+  return env.registry.solid[block];
+};
+
+const findPath = (env: TypedEnv, state: PathingState,
+                  body: PhysicsState): void => {
+  const grounded = body.resting[1] < 0;
+  if (!grounded) return;
+
+  const {min, max} = body;
+  const sx = int(Math.floor((min[0] + max[0]) / 2));
+  const sy = int(Math.floor(min[1]));
+  const sz = int(Math.floor((min[2] + max[2]) / 2));
+  const [tx, ty, tz] = nonnull(state.target);
+
+  const source = new AStarPoint(sx, sy, sz);
+  const target = new AStarPoint(tx, ty, tz);
+  const check = (p: AStarPoint) => !solid(env, p.x, p.y, p.z);
+
+  const path = AStar(source, target, check);
+  if (path.length === 0) return;
+
+  const last = path[path.length - 1];
+  const use_soft = last.x === tx && last.z === tz;
+
+  state.path = path;
+  state.path_index = 0;
+  state.path_soft_target = use_soft ? state.soft_target : null;
+  state.path_needs_precision = path.map(_ => false);
+  state.path_needs_precision[path.length - 1] = true;
+  state.target = state.soft_target = null;
+
+  //console.log(JSON.stringify(state.path));
+};
+
+/**
+ * PID (Proportional-Derivative) controller for smooth NPC movement.
+ *
+ * Uses error (distance from target) and derror (velocity) to compute
+ * corrective force. Stronger derivative term when airborne prevents overshoot.
+ */
+const PIDController =
+    (error: number, derror: number, grounded: boolean): number => {
+  const kProportionalGain = 20.0;  // Position error multiplier
+  const kDerivativeGrounded = 1.0; // Velocity damping when on ground
+  const kDerivativeAirborne = 2.0; // Stronger damping when airborne
+
+  const dfactor = grounded ? kDerivativeGrounded : kDerivativeAirborne;
+  return kProportionalGain * error + dfactor * derror;
+};
+
+const nextPathStep = (env: TypedEnv, state: PathingState,
+                      body: PhysicsState, grounded: boolean): boolean => {
+  if (!grounded) return false;
+
+  const {min, max} = body;
+  const path = nonnull(state.path);
+  const path_index = state.path_index;
+  const path_needs_precision = nonnull(state.path_needs_precision);
+  const needs_precision = path_needs_precision[path_index];
+
+  const last = path_index === path.length - 1;
+  const node = path[path_index];
+  const soft = state.path_soft_target;
+  const use_soft = last && soft && (grounded || !node.jump);
+
+  const x = use_soft ? soft[0] - 0.5 : node.x;
+  const z = use_soft ? soft[2] - 0.5 : node.z;
+  const y = node.y;
+
+  // Epsilon values for position tolerance - how close entity must be to waypoint
+  const kFinalStepTolerance = 0.4;     // Final destination - tight tolerance
+  const kPrecisionStepTolerance = 0.1; // Precision required step - very tight
+  const kFirstStepTolerance = -0.6;    // Starting position - loose (can be outside)
+  const kNormalStepTolerance = -0.4;   // Regular waypoint - moderate tolerance
+
+  const E = (() => {
+    const width = max[0] - min[0];
+    const final_path_step = path_index === path.length - 1;
+    if (final_path_step) return kFinalStepTolerance * (1 - width);
+    if (needs_precision) return kPrecisionStepTolerance * (1 - width);
+    return (path_index === 0 ? kFirstStepTolerance : kNormalStepTolerance) * width;
+  })();
+
+  const result = x + E <= min[0] && max[0] <= x + 1 - E &&
+                 y + 0 <= min[1] && max[1] <= y + 1 - 0 &&
+                 z + E <= min[2] && max[2] <= z + 1 - E;
+
+  if (result && !needs_precision && path_index < path.length - 1) {
+    const blocked = (() => {
+      const check = (x: int, y: int, z: int) => {
+        const block = env.getBlock(x, y, z);
+        return !env.registry.solid[block];
+      };
+
+      const check_move = (x: number, y: number, z: number) => {
+        Vec3.set(kPhysicsDelta, x, y, z);
+        sweep(kPhysicsBoundsMin, kPhysicsBoundsMax, kPhysicsDelta, kPhysicsResting, check, true);
+        return kPhysicsResting[0] || kPhysicsResting[1] || kPhysicsResting[2];
+      };
+
+      Vec3.copy(kPhysicsBoundsMax, body.max);
+      Vec3.copy(kPhysicsBoundsMin, body.min);
+
+      const prev = path[path_index];
+      const next = path[path_index + 1];
+      const dx = next.x + 0.5 - 0.5 * (body.min[0] + body.max[0]);
+      const dz = next.z + 0.5 - 0.5 * (body.min[2] + body.max[2]);
+      const dy = next.y - body.min[1];
+
+      // TODO(shaunak): When applied to path_index 0, this check can result in
+      // a kind of infinite loop that prevents path following. It occurs if
+      // the A-star algorithm returns a path where the first step (from the
+      // sprite's original cell to the next cell) includes a collision. A-star
+      // isn't supposed to do that, but that's a fragile invariant to rely on.
+      //
+      // When the invariant is broken, then path_needs_precision will be set
+      // for path_index 0. We'll move to the center of that cell, then move
+      // to the next path step. But as soon as we move away from the center,
+      // the next call to A-star will still have the same origin, and will
+      // re-start the loop.
+      //
+      // How can we fix this issue safely? We could double-check here that if
+      // the current path is blocked, then the path from the center of the cell
+      // is not blocked (i.e. double-check the supposed invariant). If it fails,
+      // then pathing to the block center is useless and we'll skip it.
+      return (dy > 0 && check_move(0, dy, 0)) ||
+             ((dx || dz) && check_move(dx, 0, dz));
+    })();
+
+    if (blocked) {
+      path_needs_precision[path_index] = true;
+      return false;
+    }
+  }
+
+  return result;
+};
+
+const followPath = (env: TypedEnv, state: PathingState,
+                    body: PhysicsState): void => {
+  const path = nonnull(state.path);
+  if (state.path_index === path.length) { state.path = null; return; }
+  const movement = env.movement.get(state.id);
+  if (!movement) return;
+
+  const grounded = body.resting[1] < 0;
+  if (nextPathStep(env, state, body, grounded)) state.path_index++;
+  if (state.path_index === path.length) { state.path = null; return; }
+
+  const path_index = state.path_index;
+  const last = path_index === path.length - 1;
+  const node = path[path_index];
+  const soft = state.path_soft_target;
+  const use_soft = last && soft && (grounded || !node.jump);
+
+  const cx = (body.min[0] + body.max[0]) / 2;
+  const cz = (body.min[2] + body.max[2]) / 2;
+  const dx = (use_soft ? soft[0] : node.x + 0.5) - cx;
+  const dz = (use_soft ? soft[2] : node.z + 0.5) - cz;
+
+  const penalty = movementPenalty(movement, body);
+  const speed = penalty * movement.maxSpeed;
+  const inverse_speed = speed ? 1 / speed : 1;
+
+  let inputX = PIDController(dx, -body.vel[0], grounded) * inverse_speed;
+  let inputZ = PIDController(dz, -body.vel[2], grounded) * inverse_speed;
+  const length = Math.sqrt(inputX * inputX + inputZ * inputZ);
+  const normalization = length > 1 ? 1 / length : 1;
+  movement.inputX = inputX * normalization;
+  movement.inputZ = inputZ * normalization;
+
+  if (grounded) movement._jumped = false;
+  movement.jumping = (() => {
+    if (node.y > body.min[1]) return true;
+    if (!grounded) return false;
+    if (!node.jump) return false;
+
+    if (path_index === 0) return false;
+    const prev = path[path_index - 1];
+    if (Math.floor(cx) !== prev.x) return false;
+    if (Math.floor(cz) !== prev.z) return false;
+
+    const fx = cx - prev.x;
+    const fz = cz - prev.z;
+    return (dx > 1 && fx > 0.5) || (dx < -1 && fx < 0.5) ||
+           (dz > 1 && fz > 0.5) || (dz < -1 && fz < 0.5);
+  })();
+
+  const mesh = env.meshes.get(state.id);
+  if (!mesh) return;
+  const use_dx = (grounded && use_soft) || path_index === 0;
+  const vx = use_dx ? dx : node.x - path[path_index - 1].x;
+  const vz = use_dx ? dz : node.z - path[path_index - 1].z;
+  mesh.heading = Math.atan2(vx, vz);
+};
+
+const runPathing = (env: TypedEnv, state: PathingState): void => {
+  if (!state.path && !state.target) return;
+  const body = env.physics.get(state.id);
+  if (!body) return;
+
+  if (state.target) findPath(env, state, body);
+  if (state.path) followPath(env, state, body);
+};
+
+const Pathing = (env: TypedEnv): Component<PathingState> => ({
+  init: () => ({
+    id: kNoEntity,
+    index: 0,
+    path: null,
+    path_index: 0,
+    path_soft_target: null,
+    path_needs_precision: null,
+    target: null,
+    soft_target: null,
+  }),
+  onUpdate: (dt: number, states: PathingState[]) => {
+    for (const state of states) runPathing(env, state);
+  }
+});
+
+// An entity with a MeshState keeps a renderer mesh at its position.
+
+interface MeshState {
+  id: EntityId,
+  index: int,
+  mesh: SpriteMesh | null,
+  heading: number | null,
+  columns: number,
+  column: number,
+  frame: number,
+  row: number,
+};
+
+const Meshes = (env: TypedEnv): Component<MeshState> => ({
+  init: () => ({
+    id: kNoEntity,
+    index: 0,
+    mesh: null,
+    heading: null,
+    columns: 0,
+    column: 0,
+    frame: 0,
+    row: 0,
+  }),
+  onRemove: (state: MeshState) => state.mesh?.dispose(),
+  onRender: (dt: number, states: MeshState[]) => {
+    const camera = env.renderer.camera;
+    let cx = camera.position[0], cz = camera.position[2];
+    env.target.each(state => {
+      const {x, y, z, h, w} = env.position.getX(state.id);
+      cx = x - camera.zoom * Math.sin(camera.heading);
+      cz = z - camera.zoom * Math.cos(camera.heading);
+    });
+
+    for (const state of states) {
+      if (!state.mesh) continue;
+      const {x, y, z, h} = env.position.getX(state.id);
+      const light = env.getLight(
+          int(Math.floor(x)), int(Math.floor(y)), int(Math.floor(z)));
+      state.mesh.setPosition(x, y - h / 2, z);
+      state.mesh.setLight(light);
+      state.mesh.setHeight(h);
+
+      if (state.heading !== null) {
+        const camera_heading = Math.atan2(x - cx, z - cz);
+        const delta = state.heading - camera_heading;
+        state.row = Math.floor(8.5 - 2 * delta / Math.PI) & 3;
+        state.mesh.setFrame(int(state.column + state.row * state.columns));
+      }
+    }
+  },
+  onUpdate: (dt: number, states: MeshState[]) => {
+    for (const state of states) {
+      if (!state.mesh || !state.columns) return;
+      const body = env.physics.get(state.id);
+      if (!body) return;
+
+      state.column = (() => {
+        if (body.resting[1] >= 0) return 1;
+        const distance = dt * Vec3.length(body.vel);
+        state.frame = distance ? (state.frame + 0.75 * distance) % 4 : 0;
+        if (!distance) return 0;
+        const value = Math.floor(state.frame);
+        return value & 1 ? 0 : (value + 2) >> 1;
+      })();
+      state.mesh.setFrame(int(state.column + state.row * state.columns));
+    }
+  },
+});
+
+// An entity with a ShadowState casts a discrete shadow.
+
+interface ShadowState {
+  id: EntityId,
+  index: int,
+  mesh: ShadowMesh | null,
+  extent: number,
+  height: number,
+};
+
+const Shadow = (env: TypedEnv): Component<ShadowState> => ({
+  init: () => ({id: kNoEntity, index: 0, mesh: null, extent: 16, height: 0}),
+  onRemove: (state: ShadowState) => state.mesh?.dispose(),
+  onRender: (dt: number, states: ShadowState[]) => {
+    for (const state of states) {
+      if (!state.mesh) state.mesh = env.renderer.addShadowMesh();
+      const {x, y, z, w, h} = env.position.getX(state.id);
+      const fraction = 1 - (y - 0.5 * h - state.height) / state.extent;
+      const size = 0.5 * w * Math.max(0, Math.min(1, fraction));
+      state.mesh.setPosition(x, state.height + 0.01, z);
+      state.mesh.setSize(size);
+    }
+  },
+  onUpdate: (dt: number, states: ShadowState[]) => {
+    for (const state of states) {
+      const position = env.position.getX(state.id);
+      const x = int(Math.floor(position.x));
+      const y = int(Math.floor(position.y));
+      const z = int(Math.floor(position.z));
+      state.height = (() => {
+        for (let i = 0; i < state.extent; i++) {
+          const h = y - i;
+          if (solid(env, x, int(h - 1), z)) return h;
+        }
+        return 0;
+      })();
+    }
+  },
+});
+
+// An entity with a LightState casts light.
+
+interface LightState {
+  id: EntityId,
+  index: int,
+  level: int,
+};
+
+interface PointLight {
+  x: int,
+  y: int,
+  z: int,
+  level: int,
+};
+
+const Lights = (env: TypedEnv): Component<LightState> => ({
+  init: () => ({id: kNoEntity, index: 0, level: 0}),
+  onRemove: (state: LightState) => {},
+  onUpdate: (dt: number, states: LightState[]) => {
+    const old_lights = env.point_lights;
+    const new_lights: Map<string, PointLight> = new Map();
+
+    for (const state of states) {
+      if (state.level === 0) continue;
+      const position = env.position.getX(state.id);
+      const x = int(Math.floor(position.x));
+      const y = int(Math.floor(position.y));
+      const z = int(Math.floor(position.z));
+
+      const fx = position.x - x;
+      const fz = position.z - z;
+      const ax = fx <  0.25 ? int(x - 1) : x;
+      const bx = fx >= 0.75 ? int(x + 1) : x;
+      const az = fz <  0.25 ? int(z - 1) : z;
+      const bz = fz >= 0.75 ? int(z + 1) : z;
+
+      for (let x = ax; x <= bx; x++) {
+        for (let z = az; z <= bz; z++) {
+          const key = `${x},${y},${z}`;
+          const new_value = new_lights.get(key);
+          if (new_value === undefined) {
+            new_lights.set(key, {x, y, z, level: state.level});
+          } else {
+            new_value.level = int(Math.max(new_value.level, state.level));
+          }
+        }
+      }
+    }
+
+    for (const [key, old_value] of old_lights.entries()) {
+      if (new_lights.get(key)?.level !== old_value.level) {
+        const {x, y, z} = old_value;
+        env.setPointLight(x, y, z, 0);
+      }
+    }
+    for (const [key, new_value] of new_lights.entries()) {
+      if (old_lights.get(key)?.level !== new_value.level) {
+        const {x, y, z, level} = new_value;
+        env.setPointLight(x, y, z, level);
+      }
+    }
+
+    env.point_lights = new_lights;
+  },
+});
+
+// CameraTarget signifies that the camera will follow an entity.
+
+const CameraTarget = (env: TypedEnv): Component => ({
+  init: () => ({id: kNoEntity, index: 0}),
+  onRender: (dt: number, states: ComponentState[]) => {
+    for (const state of states) {
+      const {x, y, z, h, w} = env.position.getX(state.id);
+      env.setCameraTarget(x, y + h / 3, z);
+      const mesh = env.meshes.get(state.id);
+      const zoom = env.renderer.camera.safe_zoom;
+      if (mesh && mesh.mesh) mesh.mesh.enabled = zoom > 2 * w;
+    }
+  },
+  onUpdate: (dt: number, states: ComponentState[]) => {
+    for (const state of states) {
+      const {x, y, z} = env.position.getX(state.id);
+      env.recenter(x, y, z);
+    }
+  },
+});
+
+// Putting it all together:
+
+const safeHeight = (env: Env, position: PositionState): number => {
+  const radius = 0.5 * (position.w + 1);
+  const ax = Math.floor(position.x - radius);
+  const az = Math.floor(position.z - radius);
+  const bx = Math.ceil(position.x + radius);
+  const bz = Math.ceil(position.z + radius);
+
+  let height = 0;
+  for (let x = int(ax); x <= bx; x++) {
+    for (let z = int(az); z <= bz; z++) {
+      height = Math.max(height, env.getBaseHeight(x, z));
+    }
+  }
+  return height + 0.5 * (position.h + 1);
+};
+
+const addEntity = (env: TypedEnv, image: string, size: number,
+                   x: number, z: number, h: number, w: number,
+                   maxSpeed: number, moveForceFactor: number,
+                   jumpForce: number, jumpImpulse: number): EntityId => {
+  const entity = env.entities.addEntity();
+  const position = env.position.add(entity);
+  position.x = x + 0.5;
+  position.z = z + 0.5;
+  position.w = w;
+  position.h = h;
+  position.y = safeHeight(env, position);
+
+  const movement = env.movement.add(entity);
+  movement.maxSpeed = maxSpeed;
+  movement.moveForce = maxSpeed * moveForceFactor;
+  movement.jumpForce = jumpForce;
+  movement.jumpImpulse = jumpImpulse;
+
+  const mesh = env.meshes.add(entity);
+  const sprite = {url: `images/${image}.png`, x: int(32), y: int(32)};
+  mesh.mesh = env.renderer.addSpriteMesh(size, sprite);
+  mesh.columns = 3;
+
+  if (image !== 'player') {
+    env.lights.add(entity).level = 14;
+  }
+
+  env.physics.add(entity);
+  env.shadow.add(entity);
+  return entity;
+};
+
+const main = () => {
+  const env = new TypedEnv('container');
+
+  const size = 1.5;
+  const [x, z] = [1, 1];
+  const player = addEntity(env, 'player', size, x, z, 1.5, 0.75, 8, 4, 10, 7.5);
+  env.inputs.add(player);
+  env.target.add(player);
+
+  const follower = addEntity(env, 'follower', size, x, z, 0.75, 0.75, 12, 8, 15, 10);
+  env.meshes.getX(follower).heading = 0;
+  env.pathing.add(follower);
+
+  const white: Color = [1, 1, 1, 1];
+  const texture = (x: int, y: int, alphaTest: boolean = false,
+                   color: Color = white, sparkle: boolean = false): Texture => {
+    const url = 'images/frlg.png';
+    return {alphaTest, color, sparkle, url, x, y, w: 16, h: 16};
+  };
+
+  const block = (x: int, y: int) => {
+    const url = 'images/frlg.png';
+    const frame = int(x + 16 * y);
+    return env.renderer.addInstancedMesh(frame, {url, x: 16, y: 16});
+  };
+
+  const registry = env.registry;
+  registry.addMaterial(
+      'blue', texture(12, 0, false, [0.1, 0.1, 0.4, 0.6]), true);
+  registry.addMaterial(
+      'water', texture(11, 0, false, [1, 1, 1, 0.8], true), true);
+  const textures: [string, int, int][] = [
+    ['bedrock', 6, 0],
+    ['dirt', 2, 0],
+    ['grass', 0, 0],
+    ['grass-side', 3, 0],
+    ['stone', 1, 0],
+    ['sand', 4, 0],
+    ['snow', 5, 0],
+    ['trunk', 8, 0],
+    ['trunk-side', 7, 0],
+  ];
+  for (const [name, x, y] of textures) {
+    registry.addMaterial(name, texture(x, y));
+  }
+
+  const blocks = {
+    bedrock: registry.addBlock(['bedrock'], true),
+    bush:    registry.addBlockMesh(block(10, 0), false),
+    dirt:    registry.addBlock(['dirt'], true),
+    fungi:   registry.addBlockMesh(block(13, 0), false, 9),
+    grass:   registry.addBlock(['grass', 'dirt', 'grass-side'], true),
+    rock:    registry.addBlockMesh(block(9, 0), true),
+    sand:    registry.addBlock(['sand'], true),
+    snow:    registry.addBlock(['snow'], true),
+    stone:   registry.addBlock(['stone'], true),
+    trunk:   registry.addBlock(['trunk', 'trunk-side'], true),
+    water:   registry.addBlock(['water', 'blue', 'blue'], false),
+  };
+
+  env.blocks = blocks;
+  env.refresh();
+
+  //////////////////////////////////////////////////////////////////////////////
+  // MOD: Terrain Modifications Near Spawn Point
+  //////////////////////////////////////////////////////////////////////////////
+
+  // TERRAIN MOD 1: Create a flat platform around spawn
+  // Creates a 9x9 flat stone platform at a fixed height
+  const createFlatPlatform = () => {
+    const spawnX = 1;
+    const spawnZ = 1;
+    const platformRadius = 4;  // 9x9 area (radius 4 = -4 to +4)
+    const platformHeight = 70;  // Fixed height for platform
+
+    console.log(`Creating ${platformRadius*2+1}x${platformRadius*2+1} flat platform at spawn...`);
+
+    for (let dx = -platformRadius; dx <= platformRadius; dx++) {
+      for (let dz = -platformRadius; dz <= platformRadius; dz++) {
+        const worldX = int(spawnX + dx);
+        const worldZ = int(spawnZ + dz);
+        const terrainHeight = env.getBaseHeight(worldX, worldZ);
+
+        // Fill below platform with stone
+        for (let y = 0; y <= platformHeight; y++) {
+          if (y < platformHeight - 1) {
+            // Underground: stone
+            env.setBlock(worldX, int(y), worldZ, blocks.stone);
+          } else if (y === platformHeight - 1) {
+            // Top layer: SNOW (bright white - very distinctive!)
+            env.setBlock(worldX, int(y), worldZ, blocks.snow);
+          } else {
+            // Above platform: clear air
+            env.setBlock(worldX, int(y), worldZ, kEmptyBlock);
+          }
+        }
+
+        // Clear several blocks above to ensure no floating terrain
+        for (let y = platformHeight; y < platformHeight + 10; y++) {
+          env.setBlock(worldX, int(y), worldZ, kEmptyBlock);
+        }
+      }
+    }
+
+    console.log(`Platform created at height ${platformHeight}`);
+  };
+
+  // TERRAIN MOD 2: Create a small hill near spawn
+  // Builds a circular mound of dirt/grass
+  const createHill = () => {
+    const spawnX = 1;
+    const spawnZ = 1;
+    const hillOffsetX = 5;  // 5 blocks east of spawn
+    const hillOffsetZ = 5;  // 5 blocks south of spawn
+    const hillCenterX = int(spawnX + hillOffsetX);
+    const hillCenterZ = int(spawnZ + hillOffsetZ);
+    const hillRadius = 4;
+    const hillHeight = 5;
+
+    console.log(`Creating hill at (${hillCenterX}, ${hillCenterZ})...`);
+
+    const baseHeight = env.getBaseHeight(hillCenterX, hillCenterZ);
+
+    for (let dx = -hillRadius; dx <= hillRadius; dx++) {
+      for (let dz = -hillRadius; dz <= hillRadius; dz++) {
+        const worldX = int(hillCenterX + dx);
+        const worldZ = int(hillCenterZ + dz);
+
+        // Calculate distance from hill center
+        const distance = Math.sqrt(dx * dx + dz * dz);
+
+        if (distance <= hillRadius) {
+          // Parabolic height falloff for smooth hill
+          const heightFactor = 1 - (distance / hillRadius);
+          const addedHeight = int(hillHeight * heightFactor * heightFactor);
+
+          // Build up from base terrain
+          const currentBase = env.getBaseHeight(worldX, worldZ);
+          for (let y = currentBase; y <= currentBase + addedHeight; y++) {
+            if (y === currentBase + addedHeight) {
+              // Top: grass
+              env.setBlock(worldX, int(y), worldZ, blocks.grass);
+            } else if (y > currentBase + addedHeight - 3) {
+              // Near surface: dirt
+              env.setBlock(worldX, int(y), worldZ, blocks.dirt);
+            } else {
+              // Deep: stone
+              env.setBlock(worldX, int(y), worldZ, blocks.stone);
+            }
+          }
+        }
+      }
+    }
+
+    console.log(`Hill created with radius ${hillRadius} and height ${hillHeight}`);
+  };
+
+  // TERRAIN MOD 3: Create a small pond
+  // Digs out terrain and fills with water
+  const createPond = () => {
+    const spawnX = 1;
+    const spawnZ = 1;
+    const pondOffsetX = -6;  // 6 blocks west of spawn
+    const pondOffsetZ = 2;   // 2 blocks south of spawn
+    const pondCenterX = int(spawnX + pondOffsetX);
+    const pondCenterZ = int(spawnZ + pondOffsetZ);
+    const pondRadius = 3;
+    const pondDepth = 3;
+
+    console.log(`Creating pond at (${pondCenterX}, ${pondCenterZ})...`);
+
+    const baseHeight = env.getBaseHeight(pondCenterX, pondCenterZ);
+    const waterLevel = baseHeight - 1;  // Water surface 1 block below terrain
+
+    for (let dx = -pondRadius; dx <= pondRadius; dx++) {
+      for (let dz = -pondRadius; dz <= pondRadius; dz++) {
+        const worldX = int(pondCenterX + dx);
+        const worldZ = int(pondCenterZ + dz);
+
+        // Circular pond shape
+        const distance = Math.sqrt(dx * dx + dz * dz);
+
+        if (distance <= pondRadius) {
+          // Dig out terrain
+          const digDepth = int(pondDepth * (1 - distance / pondRadius));
+          const bottomY = waterLevel - digDepth;
+
+          // Clear blocks down to bottom
+          for (let y = bottomY; y <= waterLevel + 5; y++) {
+            if (y < waterLevel) {
+              // Below water: air (will be replaced by water)
+              env.setBlock(worldX, int(y), worldZ, kEmptyBlock);
+            } else if (y <= waterLevel + 2) {
+              // Water layer
+              env.setBlock(worldX, int(y), worldZ, blocks.water);
+            } else {
+              // Above water: clear air
+              env.setBlock(worldX, int(y), worldZ, kEmptyBlock);
+            }
+          }
+
+          // Bottom of pond: sand
+          env.setBlock(worldX, int(bottomY - 1), worldZ, blocks.sand);
+        }
+      }
+    }
+
+    console.log(`Pond created with radius ${pondRadius} and depth ${pondDepth}`);
+  };
+
+  // TERRAIN MOD 4: Create a simple stone path
+  // Builds a path from spawn heading north
+  const createPath = () => {
+    const spawnX = 1;
+    const spawnZ = 1;
+    const pathLength = 15;
+    const pathWidth = 2;
+
+    console.log(`Creating stone path from spawn...`);
+
+    for (let length = 0; length < pathLength; length++) {
+      for (let width = -pathWidth; width <= pathWidth; width++) {
+        const worldX = int(spawnX + width);
+        const worldZ = int(spawnZ - length);  // Negative = north
+
+        const terrainHeight = env.getBaseHeight(worldX, worldZ);
+
+        // Place stone path at terrain level
+        env.setBlock(worldX, int(terrainHeight), worldZ, blocks.stone);
+
+        // Clear 2 blocks above path
+        env.setBlock(worldX, int(terrainHeight + 1), worldZ, kEmptyBlock);
+        env.setBlock(worldX, int(terrainHeight + 2), worldZ, kEmptyBlock);
+      }
+    }
+
+    console.log(`Path created: ${pathLength} blocks long, ${pathWidth*2+1} blocks wide`);
+  };
+
+  //////////////////////////////////////////////////////////////////////////////
+  // ACTIVATE YOUR TERRAIN MOD HERE
+  // Uncomment ONE of the following to try different terrain modifications
+  //////////////////////////////////////////////////////////////////////////////
+
+  createFlatPlatform();   // ← ACTIVE: Creates 9x9 flat platform
+  // createHill();           // Creates a small hill 5 blocks east+south
+  // createPond();           // Creates a water pond 6 blocks west
+  // createPath();           // Creates a stone path heading north
+
+  // You can also activate multiple mods at once!
+  // Example: Platform + Hill + Pond
+  // createFlatPlatform();
+  // createHill();
+  // createPond();
+};
+
+//////////////////////////////////////////////////////////////////////////////
+
+init(main);
+
+export {};
